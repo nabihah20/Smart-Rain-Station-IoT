@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meteorological Rain & AI Forecasting Hub</title>
+  <meta name="description" content="Remote monitoring and control dashboard for BLE Tipping-Bucket Rain Gauges, ESP32-S3 AMOLED station, and Google Firebase Realtime Database.">
+  
+  <!-- Modern Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- Chart.js for smooth meteorological telemetry visualization -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Google Firebase App & Realtime Database SDKs (Compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+
+  <!-- Custom Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Dynamic Ambient Background Glows -->
+  <div class="ambient-bg">
+    <div class="ambient-orb orb-1"></div>
+    <div class="ambient-orb orb-2"></div>
+    <div class="ambient-orb orb-3"></div>
+  </div>
+
+  <!-- Rain Canvas Particle Atmosphere -->
+  <canvas id="rainCanvas"></canvas>
+
+  <!-- Master Application Container -->
+  <main class="dashboard-app">
+
+    <!-- Top Navigation & Station Status Header -->
+    <header class="top-nav">
+      <div class="brand-wrapper">
+        <div class="brand-icon">🌧️</div>
+        <div>
+          <h1 class="brand-title">AeroRain Cloud Hub</h1>
+          <p class="brand-subtitle">
+            <span>Field Station: ESP32-S3 AMOLED Gateway</span>
+            <span>•</span>
+            <span id="stationTime" style="font-family: var(--font-mono); color: var(--color-cyan);">--:--:--</span>
+          </p>
+        </div>
+      </div>
+
+      <div class="status-pills">
+        <div class="pill-badge" id="cloudStatusPill">
+          <span class="pill-dot simulating"></span> Demo / Live Emulation
+        </div>
+        <button class="btn-secondary" id="btnSettings" title="Configure Cloud & Database">
+          ⚙️ Firebase Setup
+        </button>
+      </div>
+    </header>
+
+    <!-- Hero Weather Status & Remote Control Section -->
+    <section class="weather-hero">
+      
+      <!-- Current Meteorological Weather Status -->
+      <article class="hero-main-card">
+        <div class="hero-header">
+          <div>
+            <span class="tag-site">Field Site Sensor #01</span>
+            <h2 style="font-size: 16px; color: var(--text-muted); font-weight: 600;">METEOROLOGICAL RAIN RATE</h2>
+          </div>
+          <span class="station-time">WMO Standard • 0.20mm/tip</span>
+        </div>
+
+        <div class="weather-state-wrapper">
+          <div class="weather-icon-bubble" id="weatherIcon">☀️</div>
+          <div>
+            <h3 class="weather-state-title" id="weatherTitle">Clear / Sunny</h3>
+            <p class="weather-state-desc" id="weatherDesc">Atmospheric conditions dry. No precipitation registered.</p>
+          </div>
+        </div>
+
+        <div class="hero-footer">
+          <div class="hero-submetric">
+            <span class="submetric-label">Rain Intensity</span>
+            <span class="submetric-val" id="heroRateVal" style="color: var(--color-violet);">0.0 mm/h</span>
+          </div>
+          <div class="hero-submetric">
+            <span class="submetric-label">Tipping Frequency</span>
+            <span class="submetric-val" id="heroTipRateVal" style="color: var(--color-amber);">0.0 tips/min</span>
+          </div>
+          <div class="hero-submetric">
+            <span class="submetric-label">Gateway Status</span>
+            <span class="submetric-val" style="color: var(--color-emerald);">BLE + Wi-Fi Active</span>
+          </div>
+        </div>
+      </article>
+
+      <!-- Remote Station Control Quick Panel -->
+      <aside class="hero-control-card">
+        <div class="panel-header">
+          <h2 class="panel-title">📡 Station Remote Control</h2>
+          <span class="state-badge running" id="stateBadge">RUNNING</span>
+        </div>
+        <p style="font-size: 13px; color: var(--text-muted); line-height: 1.4;">
+          Remotely command the field station over Google Firebase to start, pause, or fast-forward simulated tipping cycles.
+        </p>
+
+        <div class="control-btn-grid">
+          <button class="btn-ctrl btn-run" id="btnRun">
+            ▶️ Run Station
+          </button>
+          <button class="btn-ctrl btn-stop" id="btnStop">
+            ⏸️ Stop / Pause
+          </button>
+          <button class="btn-ctrl btn-tip-now" id="btnTipNow" title="Fast forward 126 drops to trigger a mechanical tip">
+            🔔 Fast-Tip (126th)
+          </button>
+          <button class="btn-ctrl btn-reset" id="btnReset" title="Reset all accumulators to 0">
+            🔄 Reset Data
+          </button>
+        </div>
+
+        <div class="command-log">
+          <span id="commandLogText">Ready. Listening for station telemetry.</span>
+          <span style="opacity: 0.6;">v1.0-Cloud</span>
+        </div>
+      </aside>
+
+    </section>
+
+    <!-- 4 Core Primary Meteorological Metric Cards -->
+    <section class="telemetry-grid">
+      
+      <!-- Metric 1: Bucket Tips -->
+      <div class="metric-card tips">
+        <div class="card-top">
+          <span class="metric-title">Total Tips</span>
+          <div class="metric-badge-icon">🔔</div>
+        </div>
+        <div class="metric-value-row">
+          <span class="metric-number" id="tipsVal">0</span>
+          <span class="metric-unit">tips</span>
+        </div>
+        <div class="metric-progress-wrapper">
+          <div class="progress-track">
+            <div class="progress-fill amber" style="width: 100%;"></div>
+          </div>
+          <div class="metric-foot-desc">
+            <span>Mechanical count</span>
+            <span>1 tip = 0.20 mm</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metric 2: Progress to Next Tip -->
+      <div class="metric-card drops">
+        <div class="card-top">
+          <span class="metric-title">Next Tip Progress</span>
+          <div class="metric-badge-icon">💧</div>
+        </div>
+        <div class="metric-value-row">
+          <span class="metric-number" id="dropsVal">0</span>
+          <span class="metric-unit">/ 126 drops</span>
+        </div>
+        <div class="metric-progress-wrapper">
+          <div class="progress-track">
+            <div class="progress-fill cyan" id="dropsProgress" style="width: 0%;"></div>
+          </div>
+          <div class="metric-foot-desc">
+            <span>Accumulation</span>
+            <span id="dropsPercent">0.0%</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metric 3: Total Depth (mm) -->
+      <div class="metric-card depth">
+        <div class="card-top">
+          <span class="metric-title">Accumulated Depth</span>
+          <div class="metric-badge-icon">📏</div>
+        </div>
+        <div class="metric-value-row">
+          <span class="metric-number" id="depthVal">0.00</span>
+          <span class="metric-unit">mm</span>
+        </div>
+        <div class="metric-progress-wrapper">
+          <div class="progress-track">
+            <div class="progress-fill emerald" style="width: 100%;"></div>
+          </div>
+          <div class="metric-foot-desc">
+            <span>Precipitation depth</span>
+            <span>Calibrated</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metric 4: Live Rainfall Rate (mm/h) -->
+      <div class="metric-card rate">
+        <div class="card-top">
+          <span class="metric-title">Rainfall Rate</span>
+          <div class="metric-badge-icon">⚡</div>
+        </div>
+        <div class="metric-value-row">
+          <span class="metric-number" id="rateVal">0.0</span>
+          <span class="metric-unit">mm / h</span>
+        </div>
+        <div class="metric-progress-wrapper">
+          <div class="progress-track">
+            <div class="progress-fill violet" id="rateProgress" style="width: 0%;"></div>
+          </div>
+          <div class="metric-foot-desc">
+            <span>Instant rate</span>
+            <span>Rolling 5-min</span>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- Telemetry Trends & AI Forecasting Architecture -->
+    <section class="analysis-grid">
+      
+      <!-- Interactive Chart Section -->
+      <article class="chart-card">
+        <div class="chart-header">
+          <div>
+            <h2 style="font-size: 18px; font-weight: 700;">Precipitation Trends</h2>
+            <p style="font-size: 12px; color: var(--text-dim);">Live streaming telemetry timeline</p>
+          </div>
+          <div class="chart-tabs">
+            <button class="chart-tab active" id="tabRate">Rain Rate (mm/h)</button>
+            <button class="chart-tab" id="tabDepth">Total Depth (mm)</button>
+          </div>
+        </div>
+        <div class="chart-canvas-container">
+          <canvas id="rainHistoryChart"></canvas>
+        </div>
+      </article>
+
+      <!-- AI-Predictive Meteorological Forecaster (Future ML Model Integration) -->
+      <article class="ai-card">
+        <div>
+          <span class="ai-header-badge">🧠 Future AI Predictive Model</span>
+          <h2 style="font-size: 18px; font-weight: 700;">Rainfall AI Insights</h2>
+          <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+            Real-time inference pipeline analyzing tipping dynamics, intensity gradient, and runoff risk.
+          </p>
+        </div>
+
+        <div class="ai-forecast-box">
+          <div class="ai-risk-meter">
+            <span style="font-size: 12px; color: var(--text-muted); font-weight: 600;">Flash Flood / Runoff Risk</span>
+            <span class="risk-level-tag" id="aiRiskLevel">Minimal (0%)</span>
+          </div>
+          <div class="progress-track" style="margin-bottom: 12px;">
+            <div class="progress-fill emerald" id="aiRiskProgress" style="width: 5%;"></div>
+          </div>
+          <p class="ai-insight-text" id="aiInsightText">
+            Atmospheric conditions stable. Soil infiltration capacity sufficient for current precipitation.
+          </p>
+        </div>
+
+        <div class="ai-features-list">
+          <div class="ai-feature-item">
+            <span class="ai-feature-key">Model Integration</span>
+            <span class="ai-feature-val" style="color: var(--color-cyan);">Vertex AI / TF.js Ready</span>
+          </div>
+          <div class="ai-feature-item">
+            <span class="ai-feature-key">Tipping Acceleration</span>
+            <span class="ai-feature-val" id="aiAccelVal">0.00 mm/h²</span>
+          </div>
+          <div class="ai-feature-item">
+            <span class="ai-feature-key">Pattern Classification</span>
+            <span class="ai-feature-val" id="aiAnomalyVal">Natural Distribution</span>
+          </div>
+        </div>
+      </article>
+
+    </section>
+
+  </main>
+
+  <!-- Acoustic Splash & Bell Chime Toggle -->
+  <div class="splash-indicator active" id="audioToggle" title="Click to toggle sound ON / OFF">
+    🔊 Sound: ON
+  </div>
+
+  <!-- Settings & Firebase Configuration Modal -->
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal-content">
+      <h2 class="modal-title">Firebase Realtime DB Settings</h2>
+      <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px;">
+        Connect this dashboard directly to your Firebase project to stream data from the ESP32-S3 AMOLED at the site.
+      </p>
+
+      <div class="input-group">
+        <label class="input-label" for="cfgDbUrl">Database URL (e.g. https://my-rain-station-default-rtdb.firebaseio.com)</label>
+        <input type="text" id="cfgDbUrl" class="text-input" placeholder="https://your-project-default-rtdb.firebaseio.com">
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn-secondary" id="btnCancelSettings">Close</button>
+        <button class="btn-ctrl btn-run" style="padding: 10px 20px;" id="btnSaveSettings">Save & Connect</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Configuration and Logic Scripts -->
+  <script src="firebase-config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
