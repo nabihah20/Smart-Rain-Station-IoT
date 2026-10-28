@@ -1,4 +1,5 @@
-# 🌧️ Firebase Cloud & AI-Ready Rain Monitoring System
+# 🌧️ Smart Rain Station IoT
+### Intelligent Meteorological Telemetry, AMOLED Field Gateway & Cloud Forecasting
 
 An end-to-end IoT meteorological telemetry, remote control, and AI-predictive rainfall system integrating the **Arduino Nano 33 BLE** (Physical Tipping-Bucket Simulator), the **Waveshare ESP32-S3 Touch AMOLED 1.75** (Field Station Gateway & Local Visual/Acoustic Display), and a **Real-Time Cloud Web Dashboard** powered by **Google Firebase Realtime Database**.
 
