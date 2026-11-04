@@ -267,6 +267,57 @@ void initES7210() {
   Serial.println("[ES7210] Microphones powered up at MAXIMUM +37.5 dB Gain!");
 }
 
+// State tracking for dirty-redraw (eliminates screen flicker)
+static uint32_t lastDrawnDrop        = 0xFFFFFFFF;
+static uint32_t lastDrawnTip         = 0xFFFFFFFF;
+static int32_t  lastDrawnPeak        = -1;
+static int      lastDrawnNoise       = -1;
+static int32_t  lastDrawnDropThresh  = -1;
+static int32_t  lastDrawnTipThresh   = -1;
+static int      lastDrawnBarWidth    = 0;
+
+void drawDropCount(bool force = false) {
+  if (physicalDropCount != lastDrawnDrop || force) {
+    lastDrawnDrop = physicalDropCount;
+    gfx->fillRect(45, 122, 175, 80, COLOR_BG);
+    
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)physicalDropCount);
+    
+    uint8_t sz = (physicalDropCount >= 1000) ? 5 : 6;
+    int charWidth = sz * 6;
+    int totalWidth = strlen(buf) * charWidth;
+    int x = 40 + (185 - totalWidth) / 2;
+    int y = (sz == 6) ? 134 : 140;
+
+    gfx->setTextSize(sz);
+    gfx->setTextColor(COLOR_CYAN, COLOR_BG);
+    gfx->setCursor(x, y);
+    gfx->print(buf);
+  }
+}
+
+void drawTipCount(bool force = false) {
+  if (physicalTipCount != lastDrawnTip || force) {
+    lastDrawnTip = physicalTipCount;
+    gfx->fillRect(246, 122, 175, 80, COLOR_BG);
+    
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)physicalTipCount);
+    
+    uint8_t sz = (physicalTipCount >= 1000) ? 5 : 6;
+    int charWidth = sz * 6;
+    int totalWidth = strlen(buf) * charWidth;
+    int x = 241 + (185 - totalWidth) / 2;
+    int y = (sz == 6) ? 134 : 140;
+
+    gfx->setTextSize(sz);
+    gfx->setTextColor(COLOR_AMBER, COLOR_BG);
+    gfx->setCursor(x, y);
+    gfx->print(buf);
+  }
+}
+
 // ==========================================
 // 6. UI RENDERING (AMOLED ROUND SCREEN)
 // ==========================================
@@ -278,36 +329,40 @@ void renderStaticUI() {
   gfx->drawCircle(233, 233, 229, COLOR_TRACK);
 
   // Title
-  gfx->setTextColor(COLOR_CYAN);
+  gfx->setTextColor(COLOR_CYAN, COLOR_BG);
   gfx->setTextSize(2);
   gfx->setCursor(105, 38);
-  gfx->println("ACOUSTIC STATION");
+  gfx->print("ACOUSTIC STATION");
 
-  gfx->setTextColor(COLOR_TEXT_MUTED);
+  gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(1);
   gfx->setCursor(140, 62);
-  gfx->println("ES7210 ONBOARD DUAL MIC");
+  gfx->print("ES7210 ONBOARD DUAL MIC");
 
   // Dual Counters Box
   // Left: DROPS
   gfx->drawRoundRect(40, 85, 185, 125, 16, COLOR_TRACK);
-  gfx->setTextColor(COLOR_TEXT_MUTED);
+  gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(2);
   gfx->setCursor(95, 98);
-  gfx->println("DROPS");
+  gfx->print("DROPS");
 
   // Right: TIPS
   gfx->drawRoundRect(241, 85, 185, 125, 16, COLOR_TRACK);
-  gfx->setTextColor(COLOR_TEXT_MUTED);
+  gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(2);
   gfx->setCursor(308, 98);
-  gfx->println("TIPS");
+  gfx->print("TIPS");
+
+  // Render initial counters immediately
+  drawDropCount(true);
+  drawTipCount(true);
 
   // VU Meter Outline
   gfx->drawRoundRect(40, 230, 386, 32, 8, COLOR_TRACK);
 
-  // Sub-metrics
-  gfx->setTextColor(COLOR_TEXT_MUTED);
+  // Sub-metrics labels
+  gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(2);
   gfx->setCursor(50, 280);
   gfx->print("PEAK:");
@@ -321,27 +376,22 @@ void renderStaticUI() {
 
   gfx->setCursor(55, 410);
   gfx->setTextSize(1);
-  gfx->setTextColor(COLOR_CYAN);
-  gfx->println("[Serial: '+' / '-' to adjust Drop Thresh | 'r' to reset]");
+  gfx->setTextColor(COLOR_CYAN, COLOR_BG);
+  gfx->print("[Serial: '+' / '-' to adjust Drop Thresh | 'r' to reset]");
 }
 
 void updateDynamicUI() {
-  // 1. Update Drop & Tip Numbers
-  gfx->fillRect(45, 122, 175, 80, COLOR_BG);
-  gfx->setTextColor(COLOR_CYAN);
-  gfx->setTextSize(6);
-  gfx->setCursor(85, 132);
-  gfx->printf("%lu", physicalDropCount);
-
-  gfx->fillRect(246, 122, 175, 80, COLOR_BG);
-  gfx->setTextColor(COLOR_AMBER);
-  gfx->setTextSize(6);
-  gfx->setCursor(295, 132);
-  gfx->printf("%lu", physicalTipCount);
+  // 1. Update Drop & Tip Numbers (only redraws on change - 0% flicker)
+  drawDropCount();
+  drawTipCount();
 
   // 2. VU Meter Bar (0 to 20,000 range mapped to 380px)
   int barWidth = map(constrain(peakAmplitude, 0, 20000), 0, 20000, 0, 380);
-  gfx->fillRect(43, 233, 380, 26, COLOR_BG); // Clear previous bar
+  
+  if (barWidth < lastDrawnBarWidth) {
+    // Clear only the retracted portion
+    gfx->fillRect(43 + barWidth, 233, lastDrawnBarWidth - barWidth, 26, COLOR_BG);
+  }
   
   uint16_t barColor = COLOR_EMERALD;
   if (peakAmplitude >= dropThreshold) barColor = COLOR_AMBER;
@@ -350,6 +400,7 @@ void updateDynamicUI() {
   if (barWidth > 0) {
     gfx->fillRoundRect(43, 233, barWidth, 26, 6, barColor);
   }
+  lastDrawnBarWidth = barWidth;
   
   // Draw threshold tick marks on VU meter
   int dropTickX = map(constrain(dropThreshold, 0, 20000), 0, 20000, 0, 380) + 43;
@@ -358,35 +409,53 @@ void updateDynamicUI() {
   gfx->drawFastVLine(tipTickX,  226, 40, COLOR_CRIMSON);
 
   // 3. Numeric Readings
-  gfx->fillRect(115, 280, 110, 20, COLOR_BG);
-  gfx->fillRect(320, 280, 100, 20, COLOR_BG);
-  gfx->fillRect(205, 312, 110, 20, COLOR_BG);
-  gfx->fillRect(205, 342, 110, 20, COLOR_BG);
-
   gfx->setTextSize(2);
-  gfx->setTextColor(COLOR_WHITE);
-  gfx->setCursor(115, 280);
-  gfx->printf("%ld", peakAmplitude);
+  
+  // PEAK Amplitude
+  if (peakAmplitude != lastDrawnPeak) {
+    lastDrawnPeak = peakAmplitude;
+    gfx->fillRect(115, 280, 110, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+    gfx->setCursor(115, 280);
+    gfx->print(peakAmplitude);
+  }
 
-  gfx->setCursor(320, 280);
-  gfx->printf("%d", (int)noiseFloor);
+  // NOISE Floor
+  int currentNoise = (int)noiseFloor;
+  if (currentNoise != lastDrawnNoise) {
+    lastDrawnNoise = currentNoise;
+    gfx->fillRect(320, 280, 100, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+    gfx->setCursor(320, 280);
+    gfx->print(currentNoise);
+  }
 
-  gfx->setTextColor(COLOR_CYAN);
-  gfx->setCursor(205, 312);
-  gfx->printf("%ld", dropThreshold);
+  // DROP THRESHOLD
+  if (dropThreshold != lastDrawnDropThresh) {
+    lastDrawnDropThresh = dropThreshold;
+    gfx->fillRect(205, 312, 110, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_CYAN, COLOR_BG);
+    gfx->setCursor(205, 312);
+    gfx->print(dropThreshold);
+  }
 
-  gfx->setTextColor(COLOR_AMBER);
-  gfx->setCursor(205, 342);
-  gfx->printf("%ld", tipThreshold);
+  // TIP THRESHOLD
+  if (tipThreshold != lastDrawnTipThresh) {
+    lastDrawnTipThresh = tipThreshold;
+    gfx->fillRect(205, 342, 110, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_AMBER, COLOR_BG);
+    gfx->setCursor(205, 342);
+    gfx->print(tipThreshold);
+  }
 
   // 4. Event Trigger Banner
   if (triggerVisualFlash) {
     if (millis() < flashExpireTime) {
       gfx->fillRoundRect(123, 372, 220, 28, 6, flashColor);
-      gfx->setTextColor(COLOR_WHITE);
+      gfx->setTextColor(COLOR_WHITE, flashColor);
       gfx->setTextSize(2);
       gfx->setCursor(140, 378);
-      gfx->println(flashText);
+      gfx->print(flashText);
     } else {
       triggerVisualFlash = false;
       gfx->fillRect(123, 372, 220, 28, COLOR_BG);
@@ -458,6 +527,8 @@ void loop() {
     flashColor = COLOR_AMBER;
     flashExpireTime = now + 350;
 
+    drawTipCount(); // Instant on-screen counter update
+
     Serial.printf("\n[***** MECHANICAL TIP #%lu *****] Peak: %ld (LOUD)\n", physicalTipCount, peakAmplitude);
   }
   // 2. Check for SINGLE WATER DROP IMPACT
@@ -470,6 +541,8 @@ void loop() {
     strcpy(flashText, "DROP HIT! *");
     flashColor = COLOR_EMERALD;
     flashExpireTime = now + 180;
+
+    drawDropCount(); // Instant on-screen counter update
 
     Serial.printf("[DROP HIT #%lu] Peak: %ld | Noise: %.1f\n", physicalDropCount, peakAmplitude, noiseFloor);
   }
@@ -490,6 +563,8 @@ void loop() {
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
       physicalTipCount = 0;
+      drawDropCount(true);
+      drawTipCount(true);
       Serial.println("[CONFIG] Counters reset to 0.");
     }
   }
