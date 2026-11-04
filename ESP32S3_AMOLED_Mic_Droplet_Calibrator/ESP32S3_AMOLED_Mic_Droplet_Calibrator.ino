@@ -1,27 +1,19 @@
 /*
  * ==============================================================================
- * ESP32-S3 Touch AMOLED 1.75 - Onboard Microphone Droplet & Tip Calibrator
+ * ESP32-S3 Touch AMOLED 1.75 - High-Gain Onboard Dual-Mic Droplet & Tip Calibrator
  * ==============================================================================
- * Project: Smart Rain Station IoT (Workstream 05: Real-Time Droplet Counting)
+ * Project: Smart Rain Station IoT (Workstream 05: Real-Time Acoustic Detection)
  * Target Hardware: Waveshare ESP32-S3 Touch AMOLED 1.75
  * Codec / ADC: Onboard ES7210 4-Channel Audio ADC + Dual MEMS Microphones
  * Display: 466x466 Round CO5300 QSPI AMOLED (GFX_Library_for_Arduino)
  *
- * PURPOSE:
- * 1. Capture real physical water drop acoustics via the onboard MEMS mic array.
- * 2. Graph the real-time acoustic waveform in Arduino Serial Plotter (Tools > Serial Plotter).
- * 3. Provide an interactive on-screen VU meter and real droplet counter on the AMOLED display.
- * 4. Allow dynamic threshold adjustment (+ / - keys in Serial Monitor) to tune sensitivity.
- *
- * HARDWARE PIN DEFINITIONS:
- * - I2C Bus:        SDA = GPIO 15, SCL = GPIO 14 (Shared with PMIC, RTC, IMU, Touch)
- * - I2S MCLK:       GPIO 42 (Master Clock output to ES7210 / ES8311)
- * - I2S BCLK:       GPIO 9  (Bit Clock)
- * - I2S WS / LRCK:  GPIO 45 (Word Select / Frame Clock)
- * - I2S DOUT:       GPIO 8  (Data out to ES8311 speaker)
- * - I2S DIN:        GPIO 10 (Data IN from ES7210 dual microphones)
- * - PA_EN:          GPIO 46 (Speaker amplifier enable)
- * - ES7210 Address: 0x40 (I2C 7-bit slave address)
+ * KEY UPDATES:
+ * 1. Enables AXP2101 power rails and TCA9554 expander.
+ * 2. Un-mutes and powers on MIC1 & MIC2 analog bias/PGA on the ES7210.
+ * 3. Sets Maximum Preamplifier Gain (+37.5 dB) on both front microphones.
+ * 4. Configures 16-bit Standard I2S output on SDOUT1 (DIPIN = GPIO 10).
+ * 5. Dual Detection: Detects both subtle water drops AND loud mechanical bucket tips!
+ * 6. Live Waveform streaming to Arduino Serial Plotter (Ctrl + Shift + L).
  * ==============================================================================
  */
 
@@ -50,15 +42,18 @@
 
 // Audio I2S Bus
 #define I2S_PORT    I2S_NUM_0
-#define MCLKPIN     42
-#define BCLKPIN     9
-#define WSPIN       45
-#define DOPIN       8
-#define DIPIN       10  // Microphone Audio IN from ES7210
+#define MCLKPIN     42  // GPIO 42 (Shared MCLK for ES7210 & ES8311)
+#define BCLKPIN     9   // GPIO 9  (Bit Clock)
+#define WSPIN       45  // GPIO 45 (LRCK / Word Select)
+#define DOPIN       8   // GPIO 8  (ESP32 TX to ES8311 Speaker)
+#define DIPIN       10  // GPIO 10 (ES7210 Mic SDOUT1 to ESP32 RX)
 #define PA_EN_PIN   46  // Speaker Amp Enable
-#define ES7210_ADDR 0x40
-#define ES8311_ADDR 0x18
-#define AXP2101_ADDR 0x34
+
+// I2C Addresses
+#define ES7210_ADDR   0x40  // Microphone Audio ADC
+#define ES8311_ADDR   0x18  // Speaker Audio DAC
+#define TCA9554_ADDR  0x20  // Onboard IO Expander
+#define AXP2101_ADDR  0x34  // Power Management IC
 
 // ==========================================
 // 2. DISPLAY DRIVER SETUP
@@ -73,13 +68,13 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 
 // UI Colors (RGB565)
 #define COLOR_BG            0x0000 // Pure AMOLED black
-#define COLOR_TEXT_WHITE    0xFFFF
 #define COLOR_WHITE         0xFFFF
 #define COLOR_TEXT_MUTED    0x9CD3 // Slate gray
 #define COLOR_CYAN          0x3DFE // Electric cyan
 #define COLOR_AMBER         0xFD20 // Warning / amber
 #define COLOR_EMERALD       0x170A // Green / success
 #define COLOR_CRIMSON       0xF800 // Red / peak
+#define COLOR_VIOLET        0x8B5C // Violet / mechanical tip
 #define COLOR_TRACK         0x18E3 // Dark gray track
 #define COLOR_BORDER        0x0459 // Cyan border
 
@@ -92,19 +87,29 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 static int16_t audioBuffer[SAMPLES_PER_READ * 2]; // 16-bit stereo interleaved
 
 // Detection State Variables
-int32_t currentThreshold   = 3500;  // Default acoustic trigger threshold (tune with +/-)
+int32_t dropThreshold      = 2200;   // Sensitivity threshold for subtle water drop
+int32_t tipThreshold       = 12000;  // Threshold for loud mechanical bucket tip click
 int32_t peakAmplitude      = 0;
 float   rmsEnergy          = 0.0f;
 float   noiseFloor         = 300.0f;
-uint32_t physicalDropCount = 0;
-unsigned long lastDropTime = 0;
-const unsigned long DEBOUNCE_MS = 80; // Minimum delay between valid drops
 
-// UI Refresh timers
-unsigned long lastUiUpdate  = 0;
-const unsigned long UI_INTERVAL_MS = 40; // ~25 FPS UI refresh
-bool dropTriggerVisualFlash = false;
+uint32_t physicalDropCount = 0;
+uint32_t physicalTipCount  = 0;
+
+unsigned long lastDropTime = 0;
+unsigned long lastTipTime  = 0;
+const unsigned long DROP_DEBOUNCE_MS = 60;   // Drop debounce
+const unsigned long TIP_DEBOUNCE_MS  = 300;  // Tip mechanical bounce suppression
+
+// Visual flash banner
+bool triggerVisualFlash = false;
+char flashText[32] = "";
+uint16_t flashColor = COLOR_EMERALD;
 unsigned long flashExpireTime = 0;
+
+// UI Refresh timer
+unsigned long lastUiUpdate = 0;
+const unsigned long UI_INTERVAL_MS = 40; // ~25 FPS
 
 // ==========================================
 // 4. I2C REGISTER HELPERS
@@ -125,77 +130,39 @@ uint8_t readI2CReg(uint8_t devAddr, uint8_t reg) {
 }
 
 // ==========================================
-// 5. POWER MANAGEMENT (AXP2101) & ES7210 INIT
+// 5. HARDWARE INITIALIZATION
 // ==========================================
-void initPowerAndI2C() {
+void initHardwarePower() {
   Wire.begin(IIC_SDA, IIC_SCL, 400000);
   delay(50);
-  Serial.println("\n[I2C] Scanning bus...");
+  Serial.println("\n[I2C] Scanning connected peripherals...");
   
-  bool foundES7210 = false;
   for (uint8_t addr = 1; addr < 127; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
       Serial.printf("  -> Found I2C Device at 0x%02X", addr);
-      if (addr == ES7210_ADDR)  { Serial.print(" (ES7210 Mic ADC)"); foundES7210 = true; }
-      if (addr == ES8311_ADDR)  { Serial.print(" (ES8311 Audio DAC)"); }
-      if (addr == AXP2101_ADDR) { Serial.print(" (AXP2101 PMIC)"); }
+      if (addr == ES7210_ADDR)  Serial.print(" (ES7210 Microphone ADC)");
+      if (addr == ES8311_ADDR)  Serial.print(" (ES8311 Speaker Codec)");
+      if (addr == TCA9554_ADDR) Serial.print(" (TCA9554 IO Expander)");
+      if (addr == AXP2101_ADDR) Serial.print(" (AXP2101 PMIC)");
       Serial.println();
     }
   }
 
-  // Ensure Audio Power Rails are turned on via AXP2101 if present
-  // ALDO1-4 & DLDO power the analog circuitry on Waveshare boards
-  writeI2CReg(AXP2101_ADDR, 0x90, 0xFF); // Enable ALDOs
-  writeI2CReg(AXP2101_ADDR, 0x91, 0xFF); // Enable BLDOs / DLDOs
+  // 1. Ensure AXP2101 powers all internal analog audio rails
+  writeI2CReg(AXP2101_ADDR, 0x90, 0xFF); // ALDO1-4 Enable (Analog Codec Power)
+  writeI2CReg(AXP2101_ADDR, 0x91, 0xFF); // BLDO1-2 & DLDO Enable
+  delay(30);
+
+  // 2. Initialize TCA9554 IO Expander (P0-P7 outputs)
+  writeI2CReg(TCA9554_ADDR, 0x03, 0x00); // Set all pins as output
+  writeI2CReg(TCA9554_ADDR, 0x01, 0xFF); // Drive high
   delay(20);
-
-  if (!foundES7210) {
-    Serial.println("[WARN] ES7210 not immediately responding. Clocking I2S MCLK first...");
-  }
 }
 
-// Configure ES7210 4-Channel Audio ADC Registers
-void initES7210() {
-  Serial.println("[ES7210] Initializing microphone ADC registers...");
-  
-  // Software Reset
-  writeI2CReg(ES7210_ADDR, 0x00, 0xFF);
-  delay(10);
-  writeI2CReg(ES7210_ADDR, 0x00, 0x32); // Normal mode, MCLK enabled
-  
-  // Clock Management & Sample Rate Settings (16kHz standard)
-  writeI2CReg(ES7210_ADDR, 0x01, 0x3F); // Clock gating enable
-  writeI2CReg(ES7210_ADDR, 0x02, 0x00); // Analog ADC enable & normal power
-  writeI2CReg(ES7210_ADDR, 0x03, 0x20); // 16-bit I2S format, Standard Philips
-  writeI2CReg(ES7210_ADDR, 0x04, 0x01); // Slot 0 enabled
-  writeI2CReg(ES7210_ADDR, 0x05, 0x00); // Slave mode (ESP32 is Master)
-  writeI2CReg(ES7210_ADDR, 0x06, 0x00);
-  writeI2CReg(ES7210_ADDR, 0x07, 0x00);
-  writeI2CReg(ES7210_ADDR, 0x08, 0x00);
-
-  // Digital Volume / Output
-  writeI2CReg(ES7210_ADDR, 0x11, 0x60); // 16-bit data depth
-  writeI2CReg(ES7210_ADDR, 0x12, 0x02); // SDOUT1 enable
-
-  // Analog Microphone Bias & Gain Configuration
-  // Boost analog gain so subtle water drops generate sharp spikes
-  writeI2CReg(ES7210_ADDR, 0x40, 0x42); // Power up bias circuit
-  writeI2CReg(ES7210_ADDR, 0x41, 0x70); // Mic Bias voltage = 2.8V
-  writeI2CReg(ES7210_ADDR, 0x42, 0x70); 
-  writeI2CReg(ES7210_ADDR, 0x43, 0x1E); // MIC1/2 PGA Gain: +24 dB (high sensitivity)
-  writeI2CReg(ES7210_ADDR, 0x44, 0x1E); // MIC3/4 PGA Gain: +24 dB
-  writeI2CReg(ES7210_ADDR, 0x47, 0x00); // Channel 1/2 un-mute
-  writeI2CReg(ES7210_ADDR, 0x48, 0x00); // Channel 3/4 un-mute
-
-  Serial.println("[ES7210] Microphone ADC configured successfully!");
-}
-
-// ==========================================
-// 6. I2S PERIPHERAL INITIALIZATION
-// ==========================================
+// Initialize I2S peripheral (provides MCLK to ES7210 on GPIO 42)
 void initI2S() {
-  Serial.println("[I2S] Configuring ESP32-S3 I2S Master Audio Bus...");
+  Serial.println("[I2S] Initializing I2S peripheral & MCLK (GPIO 42)...");
 
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -212,141 +179,229 @@ void initI2S() {
   };
 
   i2s_pin_config_t pin_config = {
-    .mck_io_num = MCLKPIN,   // GPIO 42 (MCLK)
-    .bck_io_num = BCLKPIN,   // GPIO 9  (BCLK)
-    .ws_io_num = WSPIN,      // GPIO 45 (LRCK/WS)
+    .mck_io_num = MCLKPIN,   // GPIO 42 (MCLK out)
+    .bck_io_num = BCLKPIN,   // GPIO 9  (BCLK out)
+    .ws_io_num = WSPIN,      // GPIO 45 (LRCK/WS out)
     .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = DIPIN     // GPIO 10 (MIC DATA IN)
+    .data_in_num = DIPIN     // GPIO 10 (MIC DATA IN from ES7210 SDOUT1)
   };
 
   esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   if (err != ESP_OK) {
-    Serial.printf("[I2S] Driver install failed: %d\n", err);
+    Serial.printf("[I2S] Install error: %d\n", err);
   }
   
   err = i2s_set_pin(I2S_PORT, &pin_config);
   if (err != ESP_OK) {
-    Serial.printf("[I2S] Set pin failed: %d\n", err);
+    Serial.printf("[I2S] Set pin error: %d\n", err);
   }
 
   i2s_zero_dma_buffer(I2S_PORT);
-  Serial.println("[I2S] Microphone input active on GPIO 10.");
+  delay(50); // Allow MCLK clock to stabilize before ES7210 register writes
+  Serial.println("[I2S] I2S Audio Bus & MCLK active.");
+}
+
+// Complete official ES7210 configuration sequence for high sensitivity
+void initES7210() {
+  Serial.println("[ES7210] Configuring ES7210 microphone registers...");
+
+  // 1. Chip Software Reset
+  writeI2CReg(ES7210_ADDR, 0x00, 0xFF);
+  delay(15);
+  writeI2CReg(ES7210_ADDR, 0x00, 0x41); // Normal wake mode
+  delay(10);
+
+  // 2. Clock Gating & Power Domains
+  writeI2CReg(ES7210_ADDR, 0x01, 0x3F); // Clock gating enable
+  writeI2CReg(ES7210_ADDR, 0x09, 0x30); // State cycles
+  writeI2CReg(ES7210_ADDR, 0x0A, 0x30); // Power on state cycle
+
+  // 3. High Pass Filters (removes low hum / DC offset)
+  writeI2CReg(ES7210_ADDR, 0x23, 0x2A);
+  writeI2CReg(ES7210_ADDR, 0x22, 0x0A);
+  writeI2CReg(ES7210_ADDR, 0x20, 0x0A);
+  writeI2CReg(ES7210_ADDR, 0x21, 0x2A);
+
+  // 4. Set Slave Mode (ESP32 provides clocks)
+  writeI2CReg(ES7210_ADDR, 0x08, 0x00);
+
+  // 5. Analog Power & Microphone Bias (2.87V Bias Voltage for MEMS)
+  writeI2CReg(ES7210_ADDR, 0x40, 0x43); // Analog power up
+  writeI2CReg(ES7210_ADDR, 0x41, 0x70); // MIC1/2 Bias = 2.87V
+  writeI2CReg(ES7210_ADDR, 0x42, 0x70); // MIC3/4 Bias = 2.87V
+  writeI2CReg(ES7210_ADDR, 0x07, 0x20); // OSR setting
+  writeI2CReg(ES7210_ADDR, 0x02, 0xC1); // Main clock clear & divide
+
+  // 6. Power Up Pre-Amplifiers (PGA) for MIC1 & MIC2
+  writeI2CReg(ES7210_ADDR, 0x47, 0x08); // MIC1 Power normal
+  writeI2CReg(ES7210_ADDR, 0x48, 0x08); // MIC2 Power normal
+  writeI2CReg(ES7210_ADDR, 0x49, 0x08);
+  writeI2CReg(ES7210_ADDR, 0x4A, 0x08);
+
+  // 7. Enable ADC Power for MIC1/2
+  writeI2CReg(ES7210_ADDR, 0x4B, 0x00); // 0x00 = Power ON MIC1/2 ADC & PGA
+  writeI2CReg(ES7210_ADDR, 0x4C, 0xFF); // Power down unused MIC3/4
+
+  // 8. Set MAXIMUM ANALOG GAIN (+37.5 dB) on both front microphones!
+  // Bit 4 = Enable (0x10), Bits 3:0 = GAIN_37_5DB (0x0E) -> 0x1E
+  writeI2CReg(ES7210_ADDR, 0x43, 0x1E); // MIC1 Gain: +37.5 dB (Max sensitivity)
+  writeI2CReg(ES7210_ADDR, 0x44, 0x1E); // MIC2 Gain: +37.5 dB (Max sensitivity)
+
+  // 9. Digital Interface: Standard Philips I2S, 16-bit
+  writeI2CReg(ES7210_ADDR, 0x11, 0x60); // 16-bit standard I2S format
+  writeI2CReg(ES7210_ADDR, 0x12, 0x00); // 0x00 = Standard Stereo output on SDOUT1
+
+  // 10. Un-mute ADC digital outputs
+  writeI2CReg(ES7210_ADDR, 0x15, 0x00); // Un-mute ADC 1 & 2
+  writeI2CReg(ES7210_ADDR, 0x14, 0x03); // Mute unused ADC 3 & 4
+
+  // 11. Final Power Enable
+  writeI2CReg(ES7210_ADDR, 0x06, 0x00); // Clear power down
+  writeI2CReg(ES7210_ADDR, 0x01, 0x00); // Enable all ADC clocks
+
+  // Re-latch state
+  writeI2CReg(ES7210_ADDR, 0x00, 0x71);
+  delay(10);
+  writeI2CReg(ES7210_ADDR, 0x00, 0x41);
+
+  Serial.println("[ES7210] Microphones powered up at MAXIMUM +37.5 dB Gain!");
 }
 
 // ==========================================
-// 7. UI RENDERING (AMOLED ROUND SCREEN)
+// 6. UI RENDERING (AMOLED ROUND SCREEN)
 // ==========================================
 void renderStaticUI() {
   gfx->fillScreen(COLOR_BG);
   
-  // Outer perimeter aesthetic ring
+  // Outer perimeter rings
   gfx->drawCircle(233, 233, 230, COLOR_BORDER);
   gfx->drawCircle(233, 233, 229, COLOR_TRACK);
 
-  // Header Title
+  // Title
   gfx->setTextColor(COLOR_CYAN);
   gfx->setTextSize(2);
-  gfx->setCursor(95, 45);
-  gfx->println("ACOUSTIC CALIBRATOR");
+  gfx->setCursor(105, 38);
+  gfx->println("ACOUSTIC STATION");
 
   gfx->setTextColor(COLOR_TEXT_MUTED);
   gfx->setTextSize(1);
-  gfx->setCursor(140, 70);
-  gfx->println("ES7210 DUAL-MIC ARRAY");
+  gfx->setCursor(140, 62);
+  gfx->println("ES7210 ONBOARD DUAL MIC");
 
-  // Center Drop Counter Box
-  gfx->drawRoundRect(83, 115, 300, 110, 16, COLOR_TRACK);
+  // Dual Counters Box
+  // Left: DROPS
+  gfx->drawRoundRect(40, 85, 185, 125, 16, COLOR_TRACK);
   gfx->setTextColor(COLOR_TEXT_MUTED);
   gfx->setTextSize(2);
-  gfx->setCursor(120, 130);
-  gfx->println("REAL DROPS DETECTED");
+  gfx->setCursor(95, 98);
+  gfx->println("DROPS");
 
-  // VU Meter Track Outline
-  gfx->drawRoundRect(63, 250, 340, 36, 10, COLOR_TRACK);
-  
-  // Sub-labels
+  // Right: TIPS
+  gfx->drawRoundRect(241, 85, 185, 125, 16, COLOR_TRACK);
   gfx->setTextColor(COLOR_TEXT_MUTED);
   gfx->setTextSize(2);
-  gfx->setCursor(75, 310);
+  gfx->setCursor(308, 98);
+  gfx->println("TIPS");
+
+  // VU Meter Outline
+  gfx->drawRoundRect(40, 230, 386, 32, 8, COLOR_TRACK);
+
+  // Sub-metrics
+  gfx->setTextColor(COLOR_TEXT_MUTED);
+  gfx->setTextSize(2);
+  gfx->setCursor(50, 280);
   gfx->print("PEAK:");
-  gfx->setCursor(245, 310);
+  gfx->setCursor(240, 280);
   gfx->print("NOISE:");
 
-  gfx->setCursor(75, 345);
-  gfx->print("THRESHOLD:");
+  gfx->setCursor(50, 312);
+  gfx->print("DROP THRESH:");
+  gfx->setCursor(50, 342);
+  gfx->print("TIP  THRESH:");
 
-  gfx->setCursor(95, 405);
+  gfx->setCursor(55, 410);
   gfx->setTextSize(1);
   gfx->setTextColor(COLOR_CYAN);
-  gfx->println("[Serial: '+' or '-' to adjust threshold | 'r' to reset]");
+  gfx->println("[Serial: '+' / '-' to adjust Drop Thresh | 'r' to reset]");
 }
 
 void updateDynamicUI() {
-  // 1. Update Real Drops Count
-  gfx->fillRect(90, 155, 285, 60, COLOR_BG);
-  gfx->setTextColor(COLOR_AMBER);
+  // 1. Update Drop & Tip Numbers
+  gfx->fillRect(45, 122, 175, 80, COLOR_BG);
+  gfx->setTextColor(COLOR_CYAN);
   gfx->setTextSize(6);
-  gfx->setCursor(180, 160);
+  gfx->setCursor(85, 132);
   gfx->printf("%lu", physicalDropCount);
 
-  // 2. Update VU Meter Bar
-  // Map peak amplitude (0 - 20000) to bar width (0 - 334 pixels)
-  int barWidth = map(constrain(peakAmplitude, 0, 20000), 0, 20000, 0, 334);
-  gfx->fillRect(66, 253, 334, 30, COLOR_BG); // Clear previous bar
+  gfx->fillRect(246, 122, 175, 80, COLOR_BG);
+  gfx->setTextColor(COLOR_AMBER);
+  gfx->setTextSize(6);
+  gfx->setCursor(295, 132);
+  gfx->printf("%lu", physicalTipCount);
+
+  // 2. VU Meter Bar (0 to 20,000 range mapped to 380px)
+  int barWidth = map(constrain(peakAmplitude, 0, 20000), 0, 20000, 0, 380);
+  gfx->fillRect(43, 233, 380, 26, COLOR_BG); // Clear previous bar
   
   uint16_t barColor = COLOR_EMERALD;
-  if (peakAmplitude > (currentThreshold * 0.7)) barColor = COLOR_AMBER;
-  if (peakAmplitude >= currentThreshold)       barColor = COLOR_CRIMSON;
+  if (peakAmplitude >= dropThreshold) barColor = COLOR_AMBER;
+  if (peakAmplitude >= tipThreshold)  barColor = COLOR_CRIMSON;
   
   if (barWidth > 0) {
-    gfx->fillRoundRect(66, 253, barWidth, 30, 8, barColor);
+    gfx->fillRoundRect(43, 233, barWidth, 26, 6, barColor);
   }
   
-  // Draw threshold marker tick on VU meter
-  int thresholdX = map(constrain(currentThreshold, 0, 20000), 0, 20000, 0, 334) + 66;
-  gfx->drawFastVLine(thresholdX, 248, 40, COLOR_WHITE);
+  // Draw threshold tick marks on VU meter
+  int dropTickX = map(constrain(dropThreshold, 0, 20000), 0, 20000, 0, 380) + 43;
+  int tipTickX  = map(constrain(tipThreshold,  0, 20000), 0, 20000, 0, 380) + 43;
+  gfx->drawFastVLine(dropTickX, 226, 40, COLOR_WHITE);
+  gfx->drawFastVLine(tipTickX,  226, 40, COLOR_CRIMSON);
 
-  // 3. Update Numeric Readings
-  // Clear metric numbers region
-  gfx->fillRect(145, 310, 90, 20, COLOR_BG);
-  gfx->fillRect(320, 310, 90, 20, COLOR_BG);
-  gfx->fillRect(215, 345, 120, 20, COLOR_BG);
+  // 3. Numeric Readings
+  gfx->fillRect(115, 280, 110, 20, COLOR_BG);
+  gfx->fillRect(320, 280, 100, 20, COLOR_BG);
+  gfx->fillRect(205, 312, 110, 20, COLOR_BG);
+  gfx->fillRect(205, 342, 110, 20, COLOR_BG);
 
   gfx->setTextSize(2);
-  gfx->setTextColor(COLOR_TEXT_WHITE);
-  gfx->setCursor(145, 310);
+  gfx->setTextColor(COLOR_WHITE);
+  gfx->setCursor(115, 280);
   gfx->printf("%ld", peakAmplitude);
 
-  gfx->setCursor(320, 310);
+  gfx->setCursor(320, 280);
   gfx->printf("%d", (int)noiseFloor);
 
   gfx->setTextColor(COLOR_CYAN);
-  gfx->setCursor(215, 345);
-  gfx->printf("%ld", currentThreshold);
+  gfx->setCursor(205, 312);
+  gfx->printf("%ld", dropThreshold);
 
-  // 4. Trigger Banner Indicator
-  if (dropTriggerVisualFlash) {
+  gfx->setTextColor(COLOR_AMBER);
+  gfx->setCursor(205, 342);
+  gfx->printf("%ld", tipThreshold);
+
+  // 4. Event Trigger Banner
+  if (triggerVisualFlash) {
     if (millis() < flashExpireTime) {
-      gfx->fillRoundRect(133, 375, 200, 26, 6, COLOR_EMERALD);
-      gfx->setTextColor(COLOR_TEXT_WHITE);
+      gfx->fillRoundRect(123, 372, 220, 28, 6, flashColor);
+      gfx->setTextColor(COLOR_WHITE);
       gfx->setTextSize(2);
-      gfx->setCursor(160, 380);
-      gfx->println("DROP HIT! *");
+      gfx->setCursor(140, 378);
+      gfx->println(flashText);
     } else {
-      dropTriggerVisualFlash = false;
-      gfx->fillRect(133, 375, 200, 26, COLOR_BG);
+      triggerVisualFlash = false;
+      gfx->fillRect(123, 372, 220, 28, COLOR_BG);
     }
   }
 }
 
 // ==========================================
-// 8. SETUP & LOOP
+// 7. SETUP & MAIN LOOP
 // ==========================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n==============================================");
-  Serial.println("  ESP32-S3 AMOLED - Droplet Acoustic Calibrator");
+  Serial.println(" ESP32-S3 AMOLED: High-Gain Dual-Mic Calibrator");
   Serial.println("==============================================");
 
   // Turn on display
@@ -354,24 +409,23 @@ void setup() {
   gfx->fillScreen(COLOR_BG);
   renderStaticUI();
 
-  // Initialize I2C Bus & Codecs
-  initPowerAndI2C();
-  initI2S();     // Starts MCLK & sets GPIO 10 as input
-  initES7210();  // Configures microphone ADC registers
+  // Initialize Hardware
+  initHardwarePower();
+  initI2S();     // Starts MCLK & configures GPIO 10 as RX
+  initES7210();  // Applies full power & +37.5 dB gain
 
-  Serial.println("\n[READY] Calibration Active!");
-  Serial.println("-> Open Arduino IDE > Tools > Serial Plotter (Ctrl+Shift+L)");
-  Serial.println("-> Format: RawSignal, Threshold, DropTrigger, DropCount");
+  Serial.println("\n[READY] Calibration system listening!");
+  Serial.println("-> Open Tools > Serial Plotter (Ctrl + Shift + L)");
+  Serial.println("-> Format: RawSignal,DropThreshold,TipThreshold,DropHit,TipHit");
 }
 
 void loop() {
   size_t bytesRead = 0;
   
-  // Read raw audio samples from I2S
+  // Pull raw PCM audio data from I2S
   esp_err_t result = i2s_read(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytesRead, 100 / portTICK_PERIOD_MS);
 
   int32_t currentPeak = 0;
-  int64_t sumSquares = 0;
   int samplesRead = bytesRead / sizeof(int16_t);
 
   if (result == ESP_OK && samplesRead > 0) {
@@ -381,54 +435,68 @@ void loop() {
       if (absVal > currentPeak) {
         currentPeak = absVal;
       }
-      sumSquares += (int64_t)sample * sample;
     }
     peakAmplitude = currentPeak;
-    rmsEnergy = sqrt((float)sumSquares / samplesRead);
     
-    // Slow exponential rolling average for noise floor
+    // Slow rolling average for background noise floor
     noiseFloor = (noiseFloor * 0.95f) + ((float)peakAmplitude * 0.05f);
   }
 
-  // Droplet Impact Trigger Logic
-  int dropTriggerSpike = 0;
   unsigned long now = millis();
-  
-  if (peakAmplitude > currentThreshold && (now - lastDropTime > DEBOUNCE_MS)) {
+  int dropPlotSpike = 0;
+  int tipPlotSpike  = 0;
+
+  // 1. Check for MECHANICAL BUCKET TIP (Very Loud Shockwave)
+  if (peakAmplitude >= tipThreshold && (now - lastTipTime > TIP_DEBOUNCE_MS)) {
+    lastTipTime = now;
+    lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
+    physicalTipCount++;
+    tipPlotSpike = 20000;
+    
+    triggerVisualFlash = true;
+    strcpy(flashText, "BUCKET TIP! ***");
+    flashColor = COLOR_AMBER;
+    flashExpireTime = now + 350;
+
+    Serial.printf("\n[***** MECHANICAL TIP #%lu *****] Peak: %ld (LOUD)\n", physicalTipCount, peakAmplitude);
+  }
+  // 2. Check for SINGLE WATER DROP IMPACT
+  else if (peakAmplitude >= dropThreshold && (now - lastDropTime > DROP_DEBOUNCE_MS)) {
     lastDropTime = now;
     physicalDropCount++;
-    dropTriggerSpike = currentThreshold * 1.5; // Visual spike in Serial Plotter
-    dropTriggerVisualFlash = true;
-    flashExpireTime = now + 180; // 180ms on-screen flash
+    dropPlotSpike = 8000;
     
-    Serial.printf("\n[*** DROP HIT #%lu ***] Peak: %ld | Noise: %.1f | Threshold: %ld\n", 
-                  physicalDropCount, peakAmplitude, noiseFloor, currentThreshold);
+    triggerVisualFlash = true;
+    strcpy(flashText, "DROP HIT! *");
+    flashColor = COLOR_EMERALD;
+    flashExpireTime = now + 180;
+
+    Serial.printf("[DROP HIT #%lu] Peak: %ld | Noise: %.1f\n", physicalDropCount, peakAmplitude, noiseFloor);
   }
 
   // Stream data to Arduino Serial Plotter
-  // Format: Name:Value,Name:Value enables native colored legend lines in Arduino IDE 2.x
-  Serial.printf("RawSignal:%ld,Threshold:%ld,DropTrigger:%d,DropCount:%lu\n",
-                peakAmplitude, currentThreshold, dropTriggerSpike, physicalDropCount);
+  Serial.printf("RawSignal:%ld,DropThresh:%ld,TipThresh:%ld,DropHit:%d,TipHit:%d\n",
+                peakAmplitude, dropThreshold, tipThreshold, dropPlotSpike, tipPlotSpike);
 
-  // Check for User Input in Serial Monitor
+  // Serial Monitor Keyboard Adjustments
   if (Serial.available()) {
     char c = Serial.read();
     if (c == '+' || c == '=') {
-      currentThreshold += 250;
-      Serial.printf("[CONFIG] Threshold increased to: %ld\n", currentThreshold);
+      dropThreshold += 250;
+      Serial.printf("[CONFIG] Drop Threshold raised to: %ld\n", dropThreshold);
     } else if (c == '-' || c == '_') {
-      if (currentThreshold > 500) currentThreshold -= 250;
-      Serial.printf("[CONFIG] Threshold decreased to: %ld\n", currentThreshold);
+      if (dropThreshold > 400) dropThreshold -= 250;
+      Serial.printf("[CONFIG] Drop Threshold lowered to: %ld\n", dropThreshold);
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
-      Serial.println("[CONFIG] Drop count reset to 0.");
+      physicalTipCount = 0;
+      Serial.println("[CONFIG] Counters reset to 0.");
     }
   }
 
-  // Periodic Display Refresh (~25 FPS)
+  // Refresh display at ~25 FPS
   if (now - lastUiUpdate >= UI_INTERVAL_MS) {
     lastUiUpdate = now;
     updateDynamicUI();
   }
 }
-
