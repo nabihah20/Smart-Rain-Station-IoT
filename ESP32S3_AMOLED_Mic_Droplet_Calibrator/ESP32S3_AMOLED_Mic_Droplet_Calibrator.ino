@@ -74,6 +74,7 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 // UI Colors (RGB565)
 #define COLOR_BG            0x0000 // Pure AMOLED black
 #define COLOR_TEXT_WHITE    0xFFFF
+#define COLOR_WHITE         0xFFFF
 #define COLOR_TEXT_MUTED    0x9CD3 // Slate gray
 #define COLOR_CYAN          0x3DFE // Electric cyan
 #define COLOR_AMBER         0xFD20 // Warning / amber
@@ -430,3 +431,4 @@ void loop() {
     updateDynamicUI();
   }
 }
+
