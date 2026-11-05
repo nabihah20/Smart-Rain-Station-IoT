@@ -122,7 +122,7 @@ static int16_t audioBuffer[SAMPLES_PER_READ * 2]; // 16-bit stereo interleaved
 
 // Detection State Variables
 int32_t dropThreshold      = 2200;   // Sensitivity threshold for subtle water drop
-int32_t tipThreshold       = 12000;  // Threshold for loud mechanical bucket tip click
+int32_t tipThreshold       = 18000;  // Threshold raised to 18k (real bucket tips are 28k-32k; accidental steel/taps are ~12k)
 int32_t peakAmplitude      = 0;
 float   rmsEnergy          = 0.0f;
 float   noiseFloor         = 300.0f;
@@ -135,6 +135,15 @@ float   minResonanceDecay    = 0.32f;  // Structural ring-down floor (clap plumm
 float   maxResonanceDecay    = 0.70f;  // Structural ring-down ceiling (sustained blast stays > 0.75)
 float   minDropCrestFactor   = 2.0f;   // Subtle drop micro-transient
 
+// Frequency / Zero-Crossing Discrimination (Steel Ping vs Bucket Clack)
+int     currentZCR           = 0;
+int     maxTipZCR            = 75;     // Plastic bucket impact ZCR < 60; High metallic steel ping ZCR > 85
+
+// Physical Rain State Machine (Droplet pre-condition)
+bool     requireRainContext  = false;  // False = Bench dry test mode; True = Enforce prior drops
+uint32_t dropsSinceLastTip   = 0;
+uint32_t minDropsForTip      = 5;      // Minimum drops required before a tip is physically allowed
+
 enum TipState {
   TIP_IDLE,
   TIP_WAIT_DECAY
@@ -142,6 +151,7 @@ enum TipState {
 static TipState tipState = TIP_IDLE;
 static int32_t tipTriggerPeak = 0;
 static float tipTriggerCrest = 0.0f;
+static int tipTriggerZCR = 0;
 static unsigned long tipTriggerTime = 0;
 
 uint32_t physicalDropCount = 0;
@@ -457,10 +467,10 @@ void renderStaticUI() {
   gfx->setCursor(235, 342);
   gfx->print("MIN CR:");
 
-  gfx->setCursor(45, 410);
+  gfx->setCursor(35, 410);
   gfx->setTextSize(1);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
-  gfx->print("[+/-: Drop | [/]: Tip | c/C: Crest | r: Reset]");
+  gfx->print("[+/-:Drop | [/]:Tip | c/C:Crest | t:RainCtx | r:Reset]");
 }
 
 void updateDynamicUI() {
@@ -623,6 +633,9 @@ void loop() {
 
   if (result == ESP_OK && samplesRead > 0) {
     int64_t sumSquares = 0;
+    int zeroCrossings = 0;
+    int16_t prevSample = audioBuffer[0];
+
     for (int i = 0; i < samplesRead; i++) {
       int16_t sample = audioBuffer[i];
       int32_t absVal = abs(sample);
@@ -630,10 +643,16 @@ void loop() {
         currentPeak = absVal;
       }
       sumSquares += (int32_t)sample * (int32_t)sample;
+
+      if ((prevSample > 0 && sample < 0) || (prevSample < 0 && sample > 0)) {
+        zeroCrossings++;
+      }
+      prevSample = sample;
     }
     peakAmplitude = currentPeak;
     rmsEnergy = sqrt((float)sumSquares / samplesRead);
     crestFactor = (rmsEnergy > 10.0f) ? ((float)peakAmplitude / rmsEnergy) : 0.0f;
+    currentZCR = zeroCrossings;
     
     // Slow rolling average for background noise floor
     noiseFloor = (noiseFloor * 0.95f) + ((float)peakAmplitude * 0.05f);
@@ -645,7 +664,7 @@ void loop() {
   int rejectedPlotSpike = 0;
 
   // ========================================================
-  // TIP DISCRIMINATION STATE MACHINE (Crest + Decay Check)
+  // TIP DISCRIMINATION STATE MACHINE (ZCR + Crest + Decay + Rain Context)
   // ========================================================
   if (tipState == TIP_WAIT_DECAY) {
     unsigned long elapsed = now - tipTriggerTime;
@@ -664,8 +683,8 @@ void loop() {
         flashColor = COLOR_CRIMSON;
         flashExpireTime = now + 400;
 
-        Serial.printf("[REJECTED] Sustained Noise: Still loud (%ld / %ld, %.1f%% > %.0f%%) after %lums\n",
-                      peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, maxResonanceDecay * 100.0f, elapsed);
+        Serial.printf("[%s] [REJECTED] Sustained Noise: Still loud (%ld / %ld, %.1f%% > %.0f%%) after %lums\n",
+                      getTimestampStr().c_str(), peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, maxResonanceDecay * 100.0f, elapsed);
       }
       // 2. Check for AIRBORNE CLAP / SNAP (Plummets too fast or Crest > maxTipCrestFactor)
       else if (decayRatio < minResonanceDecay || tipTriggerCrest > maxTipCrestFactor) {
@@ -677,15 +696,42 @@ void loop() {
         flashColor = COLOR_CRIMSON;
         flashExpireTime = now + 400;
 
-        Serial.printf("[REJECTED] Airborne Clap: Plummets too fast (%ld / %ld, %.1f%% < %.0f%% | Crest: %.1fx) - No bucket wall resonance\n",
-                      peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, minResonanceDecay * 100.0f, tipTriggerCrest);
+        Serial.printf("[%s] [REJECTED] Airborne Clap: Plummets too fast (%ld / %ld, %.1f%% < %.0f%% | Crest: %.1fx) - No bucket wall resonance\n",
+                      getTimestampStr().c_str(), peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, minResonanceDecay * 100.0f, tipTriggerCrest);
       }
-      // 3. CONFIRMED MECHANICAL TIP (Solid structure-borne ring-down between 32% and 70%)
+      // 3. Check for HIGH-FREQUENCY METALLIC STEEL PING (Accidental hit on steel frame)
+      else if (tipTriggerZCR > maxTipZCR) {
+        tipState = TIP_IDLE;
+        rejectedPlotSpike = 16000;
+
+        triggerVisualFlash = true;
+        strcpy(flashText, "STEEL PING REJECT");
+        flashColor = COLOR_CRIMSON;
+        flashExpireTime = now + 400;
+
+        Serial.printf("[%s] [REJECTED] Steel Ping: High-frequency metallic ringing (ZCR: %d > %d) - Accidental metal hit, not a bucket clack\n",
+                      getTimestampStr().c_str(), tipTriggerZCR, maxTipZCR);
+      }
+      // 4. Check for RAIN CONTEXT (Physical pre-condition: Bucket cannot tip when dry!)
+      else if (requireRainContext && (dropsSinceLastTip < minDropsForTip)) {
+        tipState = TIP_IDLE;
+        rejectedPlotSpike = 16000;
+
+        triggerVisualFlash = true;
+        strcpy(flashText, "DRY BUCKET REJECT");
+        flashColor = COLOR_CRIMSON;
+        flashExpireTime = now + 400;
+
+        Serial.printf("[%s] [REJECTED] Rain Context: Bucket dry (%lu / %lu drops required) - Physical rain pre-condition failed\n",
+                      getTimestampStr().c_str(), dropsSinceLastTip, minDropsForTip);
+      }
+      // 5. CONFIRMED MECHANICAL TIP (Solid structure-borne ring-down between 32% and 70%)
       else {
         tipState = TIP_IDLE;
         lastTipTime = now;
         lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
         physicalTipCount++;
+        dropsSinceLastTip = 0; // Reset drop accumulator for next tip
         tipPlotSpike = 20000;
 
         strncpy(lastTipTimeStr, getTimestampStr().c_str(), sizeof(lastTipTimeStr));
@@ -697,8 +743,8 @@ void loop() {
 
         drawTipCount(); // Instant on-screen update with exact timestamp
 
-        Serial.printf("\n[%s] [***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Resonance Decay: %.1f%% to %ld)\n",
-                      lastTipTimeStr, physicalTipCount, tipTriggerPeak, tipTriggerCrest, decayRatio * 100.0f, peakAmplitude);
+        Serial.printf("\n[%s] [***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx | ZCR: %d (Resonance Decay: %.1f%% to %ld)\n",
+                      lastTipTimeStr, physicalTipCount, tipTriggerPeak, tipTriggerCrest, tipTriggerZCR, decayRatio * 100.0f, peakAmplitude);
       }
     }
   }
@@ -722,6 +768,7 @@ void loop() {
         tipState = TIP_WAIT_DECAY;
         tipTriggerPeak = peakAmplitude;
         tipTriggerCrest = crestFactor;
+        tipTriggerZCR = currentZCR;
         tipTriggerTime = now;
       }
     }
@@ -731,6 +778,7 @@ void loop() {
       if (crestFactor >= minDropCrestFactor) {
         lastDropTime = now;
         physicalDropCount++;
+        dropsSinceLastTip++; // Increment drop accumulator
         dropPlotSpike = 8000;
 
         strncpy(lastDropTimeStr, getTimestampStr().c_str(), sizeof(lastDropTimeStr));
@@ -773,9 +821,18 @@ void loop() {
     } else if (c == 'C') {
       minTipCrestFactor += 0.5f;
       Serial.printf("[CONFIG] Min Tip Crest Factor raised to: %.1fx\n", minTipCrestFactor);
+    } else if (c == 't' || c == 'T') {
+      requireRainContext = !requireRainContext;
+      triggerVisualFlash = true;
+      flashColor = requireRainContext ? COLOR_EMERALD : COLOR_AMBER;
+      snprintf(flashText, sizeof(flashText), requireRainContext ? "RAIN CTX: ON" : "RAIN CTX: OFF");
+      flashExpireTime = now + 500;
+      Serial.printf("[CONFIG] Rain Context Pre-Condition: %s (Requires >= %lu drops before tip)\n",
+                    requireRainContext ? "ENABLED" : "DISABLED (Bench Mode)", minDropsForTip);
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
       physicalTipCount = 0;
+      dropsSinceLastTip = 0;
       strncpy(lastTipTimeStr, "--:--:--", sizeof(lastTipTimeStr));
       strncpy(lastDropTimeStr, "--:--:--", sizeof(lastDropTimeStr));
       tipState = TIP_IDLE;
