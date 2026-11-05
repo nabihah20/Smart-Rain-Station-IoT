@@ -122,7 +122,7 @@ static int16_t audioBuffer[SAMPLES_PER_READ * 2]; // 16-bit stereo interleaved
 
 // Detection State Variables
 int32_t dropThreshold      = 2200;   // Sensitivity threshold for subtle water drop
-int32_t tipThreshold       = 18000;  // Threshold raised to 18k (real bucket tips are 28k-32k; accidental steel/taps are ~12k)
+int32_t tipThreshold       = 12500;  // Calibrated for real water tip (~14,000 peak; steel knock rejected by ZCR)
 int32_t peakAmplitude      = 0;
 float   rmsEnergy          = 0.0f;
 float   noiseFloor         = 300.0f;
@@ -733,7 +733,7 @@ void loop() {
       else {
         tipState = TIP_IDLE;
         lastTipTime = now;
-        lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
+        lastDropTime = now + 350; // Suppress mechanical tip reverberation from false drop triggers
         physicalTipCount++;
         dropsSinceLastTip = 0; // Reset drop accumulator for next tip
         tipPlotSpike = 20000;
