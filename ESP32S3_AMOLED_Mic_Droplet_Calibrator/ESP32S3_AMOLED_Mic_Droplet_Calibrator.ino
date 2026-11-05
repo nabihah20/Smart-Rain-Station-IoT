@@ -93,10 +93,13 @@ int32_t peakAmplitude      = 0;
 float   rmsEnergy          = 0.0f;
 float   noiseFloor         = 300.0f;
 
-// Advanced Signal Discrimination: Crest Factor & Decay Verification
-float   crestFactor        = 0.0f;
-float   minTipCrestFactor  = 3.5f;   // Mechanical impacts typically have Crest > 4.0; Continuous voice/noise < 2.8
-float   minDropCrestFactor = 2.0f;   // Subtle drop micro-transient
+// Advanced Signal Discrimination: Crest Factor & Structural Resonance Window
+float   crestFactor          = 0.0f;
+float   minTipCrestFactor    = 3.5f;   // Lower bound for tip impulse (continuous voice/noise < 2.8)
+float   maxTipCrestFactor    = 8.5f;   // Upper bound (airborne clap snap typically >= 9.0)
+float   minResonanceDecay    = 0.32f;  // Structural ring-down floor (clap plummets to ~0.19)
+float   maxResonanceDecay    = 0.70f;  // Structural ring-down ceiling (sustained blast stays > 0.75)
+float   minDropCrestFactor   = 2.0f;   // Subtle drop micro-transient
 
 enum TipState {
   TIP_IDLE,
@@ -574,9 +577,10 @@ void loop() {
     
     // Check after at least 15ms (1 buffer period) and before 60ms
     if (elapsed >= 15) {
-      // Check if sound decayed rapidly (hallmark of mechanical impulse)
-      if (peakAmplitude > (tipTriggerPeak * 0.65f)) {
-        // Amplitude still high! Sustained noise blast (voice / whistle / thunder)
+      float decayRatio = (float)peakAmplitude / (float)tipTriggerPeak;
+      
+      // 1. Check for SUSTAINED NOISE (Siren, whistle, continuous shout, thunder)
+      if (decayRatio > maxResonanceDecay) {
         tipState = TIP_IDLE;
         rejectedPlotSpike = 16000;
         
@@ -585,10 +589,24 @@ void loop() {
         flashColor = COLOR_CRIMSON;
         flashExpireTime = now + 400;
 
-        Serial.printf("[REJECTED] Decay Failed: Still loud (%ld / %ld, %.0f%%) after %lums -> Sustained Noise\n",
-                      peakAmplitude, tipTriggerPeak, ((float)peakAmplitude / tipTriggerPeak) * 100.0f, elapsed);
-      } else {
-        // Signal decayed sharply -> CONFIRMED MECHANICAL TIP!
+        Serial.printf("[REJECTED] Sustained Noise: Still loud (%ld / %ld, %.1f%% > %.0f%%) after %lums\n",
+                      peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, maxResonanceDecay * 100.0f, elapsed);
+      }
+      // 2. Check for AIRBORNE CLAP / SNAP (Plummets too fast or Crest > maxTipCrestFactor)
+      else if (decayRatio < minResonanceDecay || tipTriggerCrest > maxTipCrestFactor) {
+        tipState = TIP_IDLE;
+        rejectedPlotSpike = 16000;
+
+        triggerVisualFlash = true;
+        strcpy(flashText, "AIR CLAP REJECTED");
+        flashColor = COLOR_CRIMSON;
+        flashExpireTime = now + 400;
+
+        Serial.printf("[REJECTED] Airborne Clap: Plummets too fast (%ld / %ld, %.1f%% < %.0f%% | Crest: %.1fx) - No bucket wall resonance\n",
+                      peakAmplitude, tipTriggerPeak, decayRatio * 100.0f, minResonanceDecay * 100.0f, tipTriggerCrest);
+      }
+      // 3. CONFIRMED MECHANICAL TIP (Solid structure-borne ring-down between 32% and 70%)
+      else {
         tipState = TIP_IDLE;
         lastTipTime = now;
         lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
@@ -602,8 +620,8 @@ void loop() {
 
         drawTipCount(); // Instant on-screen update
 
-        Serial.printf("\n[***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Decayed cleanly to %ld)\n",
-                      physicalTipCount, tipTriggerPeak, tipTriggerCrest, peakAmplitude);
+        Serial.printf("\n[***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Resonance Decay: %.1f%% to %ld)\n",
+                      physicalTipCount, tipTriggerPeak, tipTriggerCrest, decayRatio * 100.0f, peakAmplitude);
       }
     }
   }
