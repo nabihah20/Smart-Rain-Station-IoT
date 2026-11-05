@@ -18,10 +18,44 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <Arduino_GFX_Library.h>
 #include <math.h>
+
+// ==========================================
+// 0. TIME & WI-FI (AUTO NTP OR SESSION UPTIME)
+// ==========================================
+// Connects to local Wi-Fi in background for real wall-clock time (UTC+8 / Malaysia Time)
+// If Wi-Fi is disconnected, automatically falls back to elapsed session time [HH:MM:SS]
+const char* WIFI_SSID     = "A25B";
+const char* WIFI_PASSWORD = "infinity";
+const char* NTP_SERVER1   = "pool.ntp.org";
+const char* NTP_SERVER2   = "time.google.com";
+const long  GMT_OFFSET_SEC = 28800; // UTC+8 (Malaysia Time / MYT)
+const int   DAYLIGHT_OFFSET = 0;
+
+static char lastTipTimeStr[16]  = "--:--:--";
+static char lastDropTimeStr[16] = "--:--:--";
+
+String getTimestampStr() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 10)) {
+    char timeStringBuff[32];
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M:%S", &timeinfo);
+    return String(timeStringBuff);
+  }
+  // Fallback to elapsed session time: HH:MM:SS
+  unsigned long totalSeconds = millis() / 1000;
+  int hours   = (totalSeconds / 3600);
+  int minutes = (totalSeconds % 3600) / 60;
+  int seconds = totalSeconds % 60;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d", hours, minutes, seconds);
+  return String(buf);
+}
 
 // ==========================================
 // 1. PIN DEFINITIONS
@@ -298,7 +332,7 @@ static int      lastDrawnBarWidth    = 0;
 void drawDropCount(bool force = false) {
   if (physicalDropCount != lastDrawnDrop || force) {
     lastDrawnDrop = physicalDropCount;
-    gfx->fillRect(45, 122, 175, 80, COLOR_BG);
+    gfx->fillRect(45, 122, 175, 82, COLOR_BG);
     
     char buf[12];
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)physicalDropCount);
@@ -307,19 +341,29 @@ void drawDropCount(bool force = false) {
     int charWidth = sz * 6;
     int totalWidth = strlen(buf) * charWidth;
     int x = 40 + (185 - totalWidth) / 2;
-    int y = (sz == 6) ? 134 : 140;
+    int y = (sz == 6) ? 128 : 134;
 
     gfx->setTextSize(sz);
     gfx->setTextColor(COLOR_CYAN, COLOR_BG);
     gfx->setCursor(x, y);
     gfx->print(buf);
+
+    // Exact time of last drop
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
+    char dropTimeBuf[32];
+    snprintf(dropTimeBuf, sizeof(dropTimeBuf), "LAST: %s", lastDropTimeStr);
+    int dLen = strlen(dropTimeBuf) * 6;
+    int dx = 40 + (185 - dLen) / 2;
+    gfx->setCursor(dx, 188);
+    gfx->print(dropTimeBuf);
   }
 }
 
 void drawTipCount(bool force = false) {
   if (physicalTipCount != lastDrawnTip || force) {
     lastDrawnTip = physicalTipCount;
-    gfx->fillRect(246, 122, 175, 80, COLOR_BG);
+    gfx->fillRect(246, 122, 175, 82, COLOR_BG);
     
     char buf[12];
     snprintf(buf, sizeof(buf), "%lu", (unsigned long)physicalTipCount);
@@ -328,12 +372,22 @@ void drawTipCount(bool force = false) {
     int charWidth = sz * 6;
     int totalWidth = strlen(buf) * charWidth;
     int x = 241 + (185 - totalWidth) / 2;
-    int y = (sz == 6) ? 134 : 140;
+    int y = (sz == 6) ? 128 : 134;
 
     gfx->setTextSize(sz);
     gfx->setTextColor(COLOR_AMBER, COLOR_BG);
     gfx->setCursor(x, y);
     gfx->print(buf);
+
+    // Exact time of last mechanical tip
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_AMBER, COLOR_BG);
+    char tipTimeBuf[32];
+    snprintf(tipTimeBuf, sizeof(tipTimeBuf), "LAST: %s", lastTipTimeStr);
+    int tLen = strlen(tipTimeBuf) * 6;
+    int tx = 241 + (185 - tLen) / 2;
+    gfx->setCursor(tx, 188);
+    gfx->print(tipTimeBuf);
   }
 }
 
@@ -347,11 +401,16 @@ void renderStaticUI() {
   gfx->drawCircle(233, 233, 230, COLOR_BORDER);
   gfx->drawCircle(233, 233, 229, COLOR_TRACK);
 
-  // Title
+  // Header Title & Live Top Clock
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
   gfx->setTextSize(2);
-  gfx->setCursor(105, 38);
-  gfx->print("ACOUSTIC STATION");
+  gfx->setCursor(65, 38);
+  gfx->print("RAIN STATION");
+
+  gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+  gfx->setTextSize(2);
+  gfx->setCursor(285, 38);
+  gfx->print(getTimestampStr());
 
   gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(1);
@@ -405,6 +464,17 @@ void renderStaticUI() {
 }
 
 void updateDynamicUI() {
+  // 0. Update Live Top Clock (1 Hz)
+  static unsigned long lastClockSec = 0;
+  unsigned long now = millis();
+  if (now - lastClockSec >= 1000) {
+    lastClockSec = now;
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+    gfx->setCursor(285, 38);
+    gfx->print(getTimestampStr());
+  }
+
   // 1. Update Drop & Tip Numbers (only redraws on change - 0% flicker)
   drawDropCount();
   drawTipCount();
@@ -532,6 +602,11 @@ void setup() {
   initI2S();     // Starts MCLK & configures GPIO 10 as RX
   initES7210();  // Applies full power & +37.5 dB gain
 
+  // Initialize Background Wi-Fi for Real-Time NTP Clock Sync (UTC+8 / Malaysia Time)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER1, NTP_SERVER2);
+
   Serial.println("\n[READY] Calibration system listening!");
   Serial.println("-> Open Tools > Serial Plotter (Ctrl + Shift + L)");
   Serial.println("-> Format: RawSignal,DropThreshold,TipThreshold,DropHit,TipHit,RejectedNoise");
@@ -613,15 +688,17 @@ void loop() {
         physicalTipCount++;
         tipPlotSpike = 20000;
 
+        strncpy(lastTipTimeStr, getTimestampStr().c_str(), sizeof(lastTipTimeStr));
+
         triggerVisualFlash = true;
         strcpy(flashText, "BUCKET TIP! ***");
         flashColor = COLOR_AMBER;
         flashExpireTime = now + 400;
 
-        drawTipCount(); // Instant on-screen update
+        drawTipCount(); // Instant on-screen update with exact timestamp
 
-        Serial.printf("\n[***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Resonance Decay: %.1f%% to %ld)\n",
-                      physicalTipCount, tipTriggerPeak, tipTriggerCrest, decayRatio * 100.0f, peakAmplitude);
+        Serial.printf("\n[%s] [***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Resonance Decay: %.1f%% to %ld)\n",
+                      lastTipTimeStr, physicalTipCount, tipTriggerPeak, tipTriggerCrest, decayRatio * 100.0f, peakAmplitude);
       }
     }
   }
@@ -638,8 +715,8 @@ void loop() {
         flashColor = COLOR_CRIMSON;
         flashExpireTime = now + 400;
 
-        Serial.printf("[REJECTED] Low Crest Factor: %.1fx < %.1fx | Peak: %ld, RMS: %.0f (Not a sharp click)\n",
-                      crestFactor, minTipCrestFactor, peakAmplitude, rmsEnergy);
+        Serial.printf("[%s] [REJECTED] Low Crest Factor: %.1fx < %.1fx | Peak: %ld, RMS: %.0f (Not a sharp click)\n",
+                      getTimestampStr().c_str(), crestFactor, minTipCrestFactor, peakAmplitude, rmsEnergy);
       } else {
         // Step B: High Crest detected! Candidate mechanical click -> Start Decay Verification
         tipState = TIP_WAIT_DECAY;
@@ -655,16 +732,18 @@ void loop() {
         lastDropTime = now;
         physicalDropCount++;
         dropPlotSpike = 8000;
+
+        strncpy(lastDropTimeStr, getTimestampStr().c_str(), sizeof(lastDropTimeStr));
         
         triggerVisualFlash = true;
         strcpy(flashText, "DROP HIT! *");
         flashColor = COLOR_EMERALD;
         flashExpireTime = now + 180;
 
-        drawDropCount(); // Instant on-screen update
+        drawDropCount(); // Instant on-screen update with exact timestamp
 
-        Serial.printf("[DROP HIT #%lu] Peak: %ld | Crest: %.1fx | Noise: %.1f\n",
-                      physicalDropCount, peakAmplitude, crestFactor, noiseFloor);
+        Serial.printf("[%s] [DROP HIT #%lu] Peak: %ld | Crest: %.1fx | Noise: %.1f\n",
+                      lastDropTimeStr, physicalDropCount, peakAmplitude, crestFactor, noiseFloor);
       }
     }
   }
@@ -697,6 +776,8 @@ void loop() {
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
       physicalTipCount = 0;
+      strncpy(lastTipTimeStr, "--:--:--", sizeof(lastTipTimeStr));
+      strncpy(lastDropTimeStr, "--:--:--", sizeof(lastDropTimeStr));
       tipState = TIP_IDLE;
       drawDropCount(true);
       drawTipCount(true);
