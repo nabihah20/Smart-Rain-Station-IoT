@@ -144,6 +144,9 @@ bool     requireRainContext  = false;  // False = Bench dry test mode; True = En
 uint32_t dropsSinceLastTip   = 0;
 uint32_t minDropsForTip      = 5;      // Minimum drops required before a tip is physically allowed
 
+// Serial Output Mode
+bool     enableSerialPlotter = false;  // False = Clean Timestamped Monitor; True = High-speed Serial Plotter stream
+
 enum TipState {
   TIP_IDLE,
   TIP_WAIT_DECAY
@@ -470,7 +473,7 @@ void renderStaticUI() {
   gfx->setCursor(35, 410);
   gfx->setTextSize(1);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
-  gfx->print("[+/-:Drop | [/]:Tip | c/C:Crest | t:RainCtx | r:Reset]");
+  gfx->print("[+/-:Drop | [/]:Tip | p:Plotter | t:RainCtx | r:Reset]");
 }
 
 void updateDynamicUI() {
@@ -617,9 +620,10 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER1, NTP_SERVER2);
 
-  Serial.println("\n[READY] Calibration system listening!");
-  Serial.println("-> Open Tools > Serial Plotter (Ctrl + Shift + L)");
-  Serial.println("-> Format: RawSignal,DropThreshold,TipThreshold,DropHit,TipHit,RejectedNoise");
+  Serial.printf("[%s] [READY] Acoustic calibration system listening!\n", getTimestampStr().c_str());
+  Serial.println("-> Default Mode: Clean Serial Monitor (1-sec heartbeat & timestamped events)");
+  Serial.println("-> Press 'p' in Serial to toggle high-speed stream for Tools > Serial Plotter");
+  Serial.println("-> Controls: '+' / '-' (Drop Thresh), '[' / ']' (Tip Thresh), 't' (Rain Context), 'r' (Reset)");
 }
 
 void loop() {
@@ -796,38 +800,59 @@ void loop() {
     }
   }
 
-  // Stream data to Arduino Serial Plotter
-  Serial.printf("RawSignal:%ld,DropThresh:%ld,TipThresh:%ld,DropHit:%d,TipHit:%d,RejectedNoise:%d\n",
-                peakAmplitude, dropThreshold, tipThreshold, dropPlotSpike, tipPlotSpike, rejectedPlotSpike);
+  // Stream data to Arduino Serial Plotter (if enabled)
+  if (enableSerialPlotter) {
+    Serial.printf("RawSignal:%ld,DropThresh:%ld,TipThresh:%ld,DropHit:%d,TipHit:%d,RejectedNoise:%d\n",
+                  peakAmplitude, dropThreshold, tipThreshold, dropPlotSpike, tipPlotSpike, rejectedPlotSpike);
+  } else {
+    // Clean 1-Second Timestamped Serial Monitor Status Heartbeat
+    static unsigned long lastSerialStatus = 0;
+    if (now - lastSerialStatus >= 1000) {
+      lastSerialStatus = now;
+      Serial.printf("[%s] [STATUS] Drops: %lu (Last: %s) | Tips: %lu (Last: %s) | Peak: %ld | Noise: %.0f | TipTh: %ld | RainCtx: %s\n",
+                    getTimestampStr().c_str(),
+                    physicalDropCount, lastDropTimeStr,
+                    physicalTipCount, lastTipTimeStr,
+                    peakAmplitude, noiseFloor,
+                    tipThreshold,
+                    requireRainContext ? "ON" : "OFF");
+    }
+  }
 
   // Serial Monitor Keyboard Adjustments
   if (Serial.available()) {
     char c = Serial.read();
     if (c == '+' || c == '=') {
       dropThreshold += 250;
-      Serial.printf("[CONFIG] Drop Threshold raised to: %ld\n", dropThreshold);
+      Serial.printf("[%s] [CONFIG] Drop Threshold raised to: %ld\n", getTimestampStr().c_str(), dropThreshold);
     } else if (c == '-' || c == '_') {
       if (dropThreshold > 400) dropThreshold -= 250;
-      Serial.printf("[CONFIG] Drop Threshold lowered to: %ld\n", dropThreshold);
+      Serial.printf("[%s] [CONFIG] Drop Threshold lowered to: %ld\n", getTimestampStr().c_str(), dropThreshold);
     } else if (c == ']' || c == '}') {
       tipThreshold += 1000;
-      Serial.printf("[CONFIG] Tip Threshold raised to: %ld\n", tipThreshold);
+      Serial.printf("[%s] [CONFIG] Tip Threshold raised to: %ld\n", getTimestampStr().c_str(), tipThreshold);
     } else if (c == '[' || c == '{') {
       if (tipThreshold > 4000) tipThreshold -= 1000;
-      Serial.printf("[CONFIG] Tip Threshold lowered to: %ld\n", tipThreshold);
+      Serial.printf("[%s] [CONFIG] Tip Threshold lowered to: %ld\n", getTimestampStr().c_str(), tipThreshold);
     } else if (c == 'c') {
       if (minTipCrestFactor > 1.5f) minTipCrestFactor -= 0.5f;
-      Serial.printf("[CONFIG] Min Tip Crest Factor lowered to: %.1fx\n", minTipCrestFactor);
+      Serial.printf("[%s] [CONFIG] Min Tip Crest Factor lowered to: %.1fx\n", getTimestampStr().c_str(), minTipCrestFactor);
     } else if (c == 'C') {
       minTipCrestFactor += 0.5f;
-      Serial.printf("[CONFIG] Min Tip Crest Factor raised to: %.1fx\n", minTipCrestFactor);
+      Serial.printf("[%s] [CONFIG] Min Tip Crest Factor raised to: %.1fx\n", getTimestampStr().c_str(), minTipCrestFactor);
+    } else if (c == 'p' || c == 'P') {
+      enableSerialPlotter = !enableSerialPlotter;
+      Serial.printf("[%s] [CONFIG] Serial Plotter Mode: %s\n",
+                    getTimestampStr().c_str(),
+                    enableSerialPlotter ? "ENABLED (RawSignal stream)" : "DISABLED (Clean Monitor Mode)");
     } else if (c == 't' || c == 'T') {
       requireRainContext = !requireRainContext;
       triggerVisualFlash = true;
       flashColor = requireRainContext ? COLOR_EMERALD : COLOR_AMBER;
       snprintf(flashText, sizeof(flashText), requireRainContext ? "RAIN CTX: ON" : "RAIN CTX: OFF");
       flashExpireTime = now + 500;
-      Serial.printf("[CONFIG] Rain Context Pre-Condition: %s (Requires >= %lu drops before tip)\n",
+      Serial.printf("[%s] [CONFIG] Rain Context Pre-Condition: %s (Requires >= %lu drops before tip)\n",
+                    getTimestampStr().c_str(),
                     requireRainContext ? "ENABLED" : "DISABLED (Bench Mode)", minDropsForTip);
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
@@ -838,7 +863,7 @@ void loop() {
       tipState = TIP_IDLE;
       drawDropCount(true);
       drawTipCount(true);
-      Serial.println("[CONFIG] Counters reset to 0.");
+      Serial.printf("[%s] [CONFIG] Counters reset to 0.\n", getTimestampStr().c_str());
     }
   }
 
