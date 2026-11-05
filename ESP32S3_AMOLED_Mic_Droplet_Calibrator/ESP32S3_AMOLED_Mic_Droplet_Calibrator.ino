@@ -93,6 +93,20 @@ int32_t peakAmplitude      = 0;
 float   rmsEnergy          = 0.0f;
 float   noiseFloor         = 300.0f;
 
+// Advanced Signal Discrimination: Crest Factor & Decay Verification
+float   crestFactor        = 0.0f;
+float   minTipCrestFactor  = 3.5f;   // Mechanical impacts typically have Crest > 4.0; Continuous voice/noise < 2.8
+float   minDropCrestFactor = 2.0f;   // Subtle drop micro-transient
+
+enum TipState {
+  TIP_IDLE,
+  TIP_WAIT_DECAY
+};
+static TipState tipState = TIP_IDLE;
+static int32_t tipTriggerPeak = 0;
+static float tipTriggerCrest = 0.0f;
+static unsigned long tipTriggerTime = 0;
+
 uint32_t physicalDropCount = 0;
 uint32_t physicalTipCount  = 0;
 
@@ -271,9 +285,11 @@ void initES7210() {
 static uint32_t lastDrawnDrop        = 0xFFFFFFFF;
 static uint32_t lastDrawnTip         = 0xFFFFFFFF;
 static int32_t  lastDrawnPeak        = -1;
+static int      lastDrawnCrest       = -1;
 static int      lastDrawnNoise       = -1;
 static int32_t  lastDrawnDropThresh  = -1;
 static int32_t  lastDrawnTipThresh   = -1;
+static int      lastDrawnMinCrest    = -1;
 static int      lastDrawnBarWidth    = 0;
 
 void drawDropCount(bool force = false) {
@@ -366,18 +382,23 @@ void renderStaticUI() {
   gfx->setTextSize(2);
   gfx->setCursor(50, 280);
   gfx->print("PEAK:");
-  gfx->setCursor(240, 280);
-  gfx->print("NOISE:");
+  gfx->setCursor(235, 280);
+  gfx->print("CREST:");
 
   gfx->setCursor(50, 312);
-  gfx->print("DROP THRESH:");
-  gfx->setCursor(50, 342);
-  gfx->print("TIP  THRESH:");
+  gfx->print("DROP TH:");
+  gfx->setCursor(235, 312);
+  gfx->print("NOISE:");
 
-  gfx->setCursor(55, 410);
+  gfx->setCursor(50, 342);
+  gfx->print("TIP  TH:");
+  gfx->setCursor(235, 342);
+  gfx->print("MIN CR:");
+
+  gfx->setCursor(45, 410);
   gfx->setTextSize(1);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
-  gfx->print("[Serial: '+' / '-' to adjust Drop Thresh | 'r' to reset]");
+  gfx->print("[+/-: Drop | [/]: Tip | c/C: Crest | r: Reset]");
 }
 
 void updateDynamicUI() {
@@ -411,7 +432,7 @@ void updateDynamicUI() {
   // 3. Numeric Readings
   gfx->setTextSize(2);
   
-  // PEAK Amplitude
+  // PEAK Amplitude (Left, Row 1)
   if (peakAmplitude != lastDrawnPeak) {
     lastDrawnPeak = peakAmplitude;
     gfx->fillRect(115, 280, 110, 20, COLOR_BG);
@@ -420,32 +441,57 @@ void updateDynamicUI() {
     gfx->print(peakAmplitude);
   }
 
-  // NOISE Floor
-  int currentNoise = (int)noiseFloor;
-  if (currentNoise != lastDrawnNoise) {
-    lastDrawnNoise = currentNoise;
-    gfx->fillRect(320, 280, 100, 20, COLOR_BG);
-    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
-    gfx->setCursor(320, 280);
-    gfx->print(currentNoise);
+  // CREST Factor (Right, Row 1)
+  int crestInt = (int)(crestFactor * 10.0f);
+  if (crestInt != lastDrawnCrest) {
+    lastDrawnCrest = crestInt;
+    gfx->fillRect(315, 280, 105, 20, COLOR_BG);
+    uint16_t cColor = (crestFactor >= minTipCrestFactor) ? COLOR_EMERALD : COLOR_WHITE;
+    gfx->setTextColor(cColor, COLOR_BG);
+    gfx->setCursor(315, 280);
+    char cBuf[10];
+    snprintf(cBuf, sizeof(cBuf), "%.1fx", crestFactor);
+    gfx->print(cBuf);
   }
 
-  // DROP THRESHOLD
+  // DROP THRESHOLD (Left, Row 2)
   if (dropThreshold != lastDrawnDropThresh) {
     lastDrawnDropThresh = dropThreshold;
-    gfx->fillRect(205, 312, 110, 20, COLOR_BG);
+    gfx->fillRect(150, 312, 80, 20, COLOR_BG);
     gfx->setTextColor(COLOR_CYAN, COLOR_BG);
-    gfx->setCursor(205, 312);
+    gfx->setCursor(150, 312);
     gfx->print(dropThreshold);
   }
 
-  // TIP THRESHOLD
+  // NOISE Floor (Right, Row 2)
+  int currentNoise = (int)noiseFloor;
+  if (currentNoise != lastDrawnNoise) {
+    lastDrawnNoise = currentNoise;
+    gfx->fillRect(315, 312, 105, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
+    gfx->setCursor(315, 312);
+    gfx->print(currentNoise);
+  }
+
+  // TIP THRESHOLD (Left, Row 3)
   if (tipThreshold != lastDrawnTipThresh) {
     lastDrawnTipThresh = tipThreshold;
-    gfx->fillRect(205, 342, 110, 20, COLOR_BG);
+    gfx->fillRect(145, 342, 85, 20, COLOR_BG);
     gfx->setTextColor(COLOR_AMBER, COLOR_BG);
-    gfx->setCursor(205, 342);
+    gfx->setCursor(145, 342);
     gfx->print(tipThreshold);
+  }
+
+  // MIN CREST THRESHOLD (Right, Row 3)
+  int minCrInt = (int)(minTipCrestFactor * 10.0f);
+  if (minCrInt != lastDrawnMinCrest) {
+    lastDrawnMinCrest = minCrInt;
+    gfx->fillRect(325, 342, 95, 20, COLOR_BG);
+    gfx->setTextColor(COLOR_AMBER, COLOR_BG);
+    gfx->setCursor(325, 342);
+    char crBuf[10];
+    snprintf(crBuf, sizeof(crBuf), "%.1fx", minTipCrestFactor);
+    gfx->print(crBuf);
   }
 
   // 4. Event Trigger Banner
@@ -485,7 +531,7 @@ void setup() {
 
   Serial.println("\n[READY] Calibration system listening!");
   Serial.println("-> Open Tools > Serial Plotter (Ctrl + Shift + L)");
-  Serial.println("-> Format: RawSignal,DropThreshold,TipThreshold,DropHit,TipHit");
+  Serial.println("-> Format: RawSignal,DropThreshold,TipThreshold,DropHit,TipHit,RejectedNoise");
 }
 
 void loop() {
@@ -498,58 +544,116 @@ void loop() {
   int samplesRead = bytesRead / sizeof(int16_t);
 
   if (result == ESP_OK && samplesRead > 0) {
+    int64_t sumSquares = 0;
     for (int i = 0; i < samplesRead; i++) {
       int16_t sample = audioBuffer[i];
       int32_t absVal = abs(sample);
       if (absVal > currentPeak) {
         currentPeak = absVal;
       }
+      sumSquares += (int32_t)sample * (int32_t)sample;
     }
     peakAmplitude = currentPeak;
+    rmsEnergy = sqrt((float)sumSquares / samplesRead);
+    crestFactor = (rmsEnergy > 10.0f) ? ((float)peakAmplitude / rmsEnergy) : 0.0f;
     
     // Slow rolling average for background noise floor
     noiseFloor = (noiseFloor * 0.95f) + ((float)peakAmplitude * 0.05f);
   }
 
   unsigned long now = millis();
-  int dropPlotSpike = 0;
-  int tipPlotSpike  = 0;
+  int dropPlotSpike     = 0;
+  int tipPlotSpike      = 0;
+  int rejectedPlotSpike = 0;
 
-  // 1. Check for MECHANICAL BUCKET TIP (Very Loud Shockwave)
-  if (peakAmplitude >= tipThreshold && (now - lastTipTime > TIP_DEBOUNCE_MS)) {
-    lastTipTime = now;
-    lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
-    physicalTipCount++;
-    tipPlotSpike = 20000;
+  // ========================================================
+  // TIP DISCRIMINATION STATE MACHINE (Crest + Decay Check)
+  // ========================================================
+  if (tipState == TIP_WAIT_DECAY) {
+    unsigned long elapsed = now - tipTriggerTime;
     
-    triggerVisualFlash = true;
-    strcpy(flashText, "BUCKET TIP! ***");
-    flashColor = COLOR_AMBER;
-    flashExpireTime = now + 350;
+    // Check after at least 15ms (1 buffer period) and before 60ms
+    if (elapsed >= 15) {
+      // Check if sound decayed rapidly (hallmark of mechanical impulse)
+      if (peakAmplitude > (tipTriggerPeak * 0.65f)) {
+        // Amplitude still high! Sustained noise blast (voice / whistle / thunder)
+        tipState = TIP_IDLE;
+        rejectedPlotSpike = 16000;
+        
+        triggerVisualFlash = true;
+        strcpy(flashText, "SUSTAINED NOISE!");
+        flashColor = COLOR_CRIMSON;
+        flashExpireTime = now + 400;
 
-    drawTipCount(); // Instant on-screen counter update
+        Serial.printf("[REJECTED] Decay Failed: Still loud (%ld / %ld, %.0f%%) after %lums -> Sustained Noise\n",
+                      peakAmplitude, tipTriggerPeak, ((float)peakAmplitude / tipTriggerPeak) * 100.0f, elapsed);
+      } else {
+        // Signal decayed sharply -> CONFIRMED MECHANICAL TIP!
+        tipState = TIP_IDLE;
+        lastTipTime = now;
+        lastDropTime = now + 150; // Prevent tip reverberation from triggering a false drop
+        physicalTipCount++;
+        tipPlotSpike = 20000;
 
-    Serial.printf("\n[***** MECHANICAL TIP #%lu *****] Peak: %ld (LOUD)\n", physicalTipCount, peakAmplitude);
+        triggerVisualFlash = true;
+        strcpy(flashText, "BUCKET TIP! ***");
+        flashColor = COLOR_AMBER;
+        flashExpireTime = now + 400;
+
+        drawTipCount(); // Instant on-screen update
+
+        Serial.printf("\n[***** MECHANICAL TIP #%lu CONFIRMED *****] Peak: %ld | Crest: %.1fx (Decayed cleanly to %ld)\n",
+                      physicalTipCount, tipTriggerPeak, tipTriggerCrest, peakAmplitude);
+      }
+    }
   }
-  // 2. Check for SINGLE WATER DROP IMPACT
-  else if (peakAmplitude >= dropThreshold && (now - lastDropTime > DROP_DEBOUNCE_MS)) {
-    lastDropTime = now;
-    physicalDropCount++;
-    dropPlotSpike = 8000;
-    
-    triggerVisualFlash = true;
-    strcpy(flashText, "DROP HIT! *");
-    flashColor = COLOR_EMERALD;
-    flashExpireTime = now + 180;
+  else if (tipState == TIP_IDLE) {
+    // 1. Check for POTENTIAL MECHANICAL TIP
+    if (peakAmplitude >= tipThreshold && (now - lastTipTime > TIP_DEBOUNCE_MS)) {
+      // Step A: Crest Factor Check (Impulse vs Continuous Noise)
+      if (crestFactor < minTipCrestFactor) {
+        // Continuous / Drone noise: Shouting, thunder, car engine, or blowing into mic
+        rejectedPlotSpike = 16000;
+        
+        triggerVisualFlash = true;
+        strcpy(flashText, "NOISE REJECTED!");
+        flashColor = COLOR_CRIMSON;
+        flashExpireTime = now + 400;
 
-    drawDropCount(); // Instant on-screen counter update
+        Serial.printf("[REJECTED] Low Crest Factor: %.1fx < %.1fx | Peak: %ld, RMS: %.0f (Not a sharp click)\n",
+                      crestFactor, minTipCrestFactor, peakAmplitude, rmsEnergy);
+      } else {
+        // Step B: High Crest detected! Candidate mechanical click -> Start Decay Verification
+        tipState = TIP_WAIT_DECAY;
+        tipTriggerPeak = peakAmplitude;
+        tipTriggerCrest = crestFactor;
+        tipTriggerTime = now;
+      }
+    }
+    // 2. Check for SINGLE WATER DROP IMPACT
+    else if (peakAmplitude >= dropThreshold && (now - lastDropTime > DROP_DEBOUNCE_MS)) {
+      // Droplets are also sharp micro-impulses (crest factor >= minDropCrestFactor)
+      if (crestFactor >= minDropCrestFactor) {
+        lastDropTime = now;
+        physicalDropCount++;
+        dropPlotSpike = 8000;
+        
+        triggerVisualFlash = true;
+        strcpy(flashText, "DROP HIT! *");
+        flashColor = COLOR_EMERALD;
+        flashExpireTime = now + 180;
 
-    Serial.printf("[DROP HIT #%lu] Peak: %ld | Noise: %.1f\n", physicalDropCount, peakAmplitude, noiseFloor);
+        drawDropCount(); // Instant on-screen update
+
+        Serial.printf("[DROP HIT #%lu] Peak: %ld | Crest: %.1fx | Noise: %.1f\n",
+                      physicalDropCount, peakAmplitude, crestFactor, noiseFloor);
+      }
+    }
   }
 
   // Stream data to Arduino Serial Plotter
-  Serial.printf("RawSignal:%ld,DropThresh:%ld,TipThresh:%ld,DropHit:%d,TipHit:%d\n",
-                peakAmplitude, dropThreshold, tipThreshold, dropPlotSpike, tipPlotSpike);
+  Serial.printf("RawSignal:%ld,DropThresh:%ld,TipThresh:%ld,DropHit:%d,TipHit:%d,RejectedNoise:%d\n",
+                peakAmplitude, dropThreshold, tipThreshold, dropPlotSpike, tipPlotSpike, rejectedPlotSpike);
 
   // Serial Monitor Keyboard Adjustments
   if (Serial.available()) {
@@ -560,9 +664,22 @@ void loop() {
     } else if (c == '-' || c == '_') {
       if (dropThreshold > 400) dropThreshold -= 250;
       Serial.printf("[CONFIG] Drop Threshold lowered to: %ld\n", dropThreshold);
+    } else if (c == ']' || c == '}') {
+      tipThreshold += 1000;
+      Serial.printf("[CONFIG] Tip Threshold raised to: %ld\n", tipThreshold);
+    } else if (c == '[' || c == '{') {
+      if (tipThreshold > 4000) tipThreshold -= 1000;
+      Serial.printf("[CONFIG] Tip Threshold lowered to: %ld\n", tipThreshold);
+    } else if (c == 'c') {
+      if (minTipCrestFactor > 1.5f) minTipCrestFactor -= 0.5f;
+      Serial.printf("[CONFIG] Min Tip Crest Factor lowered to: %.1fx\n", minTipCrestFactor);
+    } else if (c == 'C') {
+      minTipCrestFactor += 0.5f;
+      Serial.printf("[CONFIG] Min Tip Crest Factor raised to: %.1fx\n", minTipCrestFactor);
     } else if (c == 'r' || c == 'R') {
       physicalDropCount = 0;
       physicalTipCount = 0;
+      tipState = TIP_IDLE;
       drawDropCount(true);
       drawTipCount(true);
       Serial.println("[CONFIG] Counters reset to 0.");
