@@ -87,8 +87,8 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 #define ENVELOPE_POINTS     16
 #define SPECTRAL_BANDS      8
 
-// Sensitivity threshold for capturing an impact during the 10s window (Lowered from 3500 to 1200 to catch gentle left tips; adjustable with '+' / '-')
-int32_t triggerThreshold = 1200;
+// Sensitivity threshold for capturing an impact during the 10s window (Mechanical bucket clacks peak at 8000-28000; default set to 4000 to reject water drops ~1500 and ambient noise ~500)
+int32_t triggerThreshold = 4000;
 int32_t liveWindowMaxPeak = 0; // Tracks the loudest peak heard during active 10s window
 int32_t liveBatchPeak = 0;     // Instantaneous peak in current batch
 
@@ -758,11 +758,14 @@ void loop() {
   // ========================================================
   // SERIAL KEYBOARD COMMANDS
   // ========================================================
-  if (Serial.available()) {
+  while (Serial.available()) {
     char c = Serial.read();
 
-    // 's', 'S', spacebar, or Enter to START or ACCEPT
-    if (c == 's' || c == 'S' || c == ' ' || c == '\n' || c == '\r') {
+    // Ignore newline and carriage return characters from terminal enter key
+    if (c == '\r' || c == '\n') continue;
+
+    // 's' or 'S' to START countdown or ACCEPT sample
+    if (c == 's' || c == 'S') {
       if (sessionState == STATE_WAIT_FOR_START) {
         if (currentTarget != TARGET_ALL_COMPLETE) {
           sessionState = STATE_LISTENING_10S;
