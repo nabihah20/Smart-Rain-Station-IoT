@@ -87,8 +87,10 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 #define ENVELOPE_POINTS     16
 #define SPECTRAL_BANDS      8
 
-// Sensitivity threshold for capturing an impact during the 10s window
-int32_t triggerThreshold = 3500;
+// Sensitivity threshold for capturing an impact during the 10s window (Lowered from 3500 to 1200 to catch gentle left tips; adjustable with '+' / '-')
+int32_t triggerThreshold = 1200;
+int32_t liveWindowMaxPeak = 0; // Tracks the loudest peak heard during active 10s window
+int32_t liveBatchPeak = 0;     // Instantaneous peak in current batch
 
 static int16_t audioBuffer[SAMPLES_PER_READ * 2]; // 16-bit stereo
 static int16_t ringBuffer[PROFILE_SAMPLES];       // Pre-trigger ring buffer
@@ -653,11 +655,12 @@ void loop() {
       updateInteractiveBox();
     }
 
-    // Print countdown second tick in Serial Monitor
+    // Print countdown second tick in Serial Monitor with live sound level telemetry
     int secLeft = 10 - (elapsed / 1000);
     if (secLeft != lastCountdownSec && secLeft >= 0) {
       lastCountdownSec = secLeft;
-      Serial.printf("[LISTENING] %d seconds remaining... (tip bucket now)\n", secLeft);
+      Serial.printf("[LISTENING] %2d sec left | Live Peak: %5ld | Max Heard: %5ld | Thresh: %5ld\n",
+                    secLeft, liveBatchPeak, liveWindowMaxPeak, triggerThreshold);
     }
 
     // Check for Timeout
@@ -665,18 +668,34 @@ void loop() {
       sessionState = STATE_WAIT_FOR_START;
       lastCountdownSec = -1;
       updateInteractiveBox();
-      Serial.println("\n[TIMEOUT] 10 seconds expired with no sound detected.");
+      Serial.println("\n[TIMEOUT] 10 seconds expired with no trigger reached.");
+      Serial.printf("  Loudest sound heard in window was Peak: %ld (Threshold is %ld)\n", liveWindowMaxPeak, triggerThreshold);
+      if (liveWindowMaxPeak > 300 && liveWindowMaxPeak < triggerThreshold) {
+        Serial.printf("  -> TIP: The sound reached %ld! You can lower threshold by pressing '-' or retry.\n", liveWindowMaxPeak);
+      }
       Serial.println("-> Type 's' and press Enter to try this sample again.");
     }
   }
 
   // ========================================================
-  // AUDIO CAPTURE ENGINE
+  // AUDIO CAPTURE ENGINE (DUAL-MIC COMBINED STEREO)
   // ========================================================
   if (result == ESP_OK && samplesRead > 0) {
+    liveBatchPeak = 0;
     for (int i = 0; i < samplesRead; i += 2) {
-      int16_t sample = audioBuffer[i];
+      int16_t mic1 = audioBuffer[i];     // Channel 0 (MIC1)
+      int16_t mic2 = audioBuffer[i + 1]; // Channel 1 (MIC2)
+
+      // Take the louder channel to guarantee both left and right bucket impacts are heard
+      int16_t sample = (abs(mic1) >= abs(mic2)) ? mic1 : mic2;
       int32_t absVal = abs(sample);
+
+      if (absVal > liveBatchPeak) liveBatchPeak = absVal;
+
+      // Track peak during 10s listening window
+      if (sessionState == STATE_LISTENING_10S) {
+        if (absVal > liveWindowMaxPeak) liveWindowMaxPeak = absVal;
+      }
 
       // Store in circular ring buffer
       ringBuffer[ringIndex] = sample;
@@ -749,6 +768,7 @@ void loop() {
           sessionState = STATE_LISTENING_10S;
           windowStartTime = millis();
           recordingTriggered = false;
+          liveWindowMaxPeak = 0;
           lastCountdownSec = -1;
           updateInteractiveBox();
 
@@ -803,6 +823,16 @@ void loop() {
         sessionState = STATE_WAIT_FOR_START;
         updateInteractiveBox();
       }
+    }
+    // '+' or '=' to INCREASE sensitivity threshold
+    else if (c == '+' || c == '=') {
+      triggerThreshold += 250;
+      Serial.printf("[CONFIG] Trigger threshold increased to: %ld\n", triggerThreshold);
+    }
+    // '-' or '_' to DECREASE sensitivity threshold
+    else if (c == '-' || c == '_') {
+      if (triggerThreshold > 300) triggerThreshold -= 250;
+      Serial.printf("[CONFIG] Trigger threshold decreased to: %ld\n", triggerThreshold);
     }
     // 'r' or 'R' to RETRY the current sample
     else if (c == 'r' || c == 'R') {
