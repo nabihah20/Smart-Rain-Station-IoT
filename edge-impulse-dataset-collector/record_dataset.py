@@ -33,6 +33,28 @@ def list_existing_counts():
         counts[c] = len(files)
     return counts
 
+def delete_all_dataset():
+    for c in CLASSES:
+        path = os.path.join(DATASET_ROOT, c)
+        for f in os.listdir(path):
+            if f.endswith(".wav"):
+                try:
+                    os.remove(os.path.join(path, f))
+                except Exception as e:
+                    print(f"Error removing {f}: {e}")
+    print("[SUCCESS] Cleared all recorded samples from dataset folders.")
+
+def delete_last_sample(class_name):
+    path = os.path.join(DATASET_ROOT, class_name)
+    files = [f for f in os.listdir(path) if f.endswith(".wav")]
+    if not files:
+        print(f"No samples found in {class_name} to delete.")
+        return
+    files.sort(key=lambda x: os.path.getmtime(os.path.join(path, x)))
+    last_file = files[-1]
+    os.remove(os.path.join(path, last_file))
+    print(f"[REMOVED] Deleted last sample: {last_file}")
+
 def save_wav(filepath, pcm_bytes):
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(1)  # Mono
@@ -108,10 +130,12 @@ def main():
             print(f"  [1] TIP BUCKET   (Current: {counts['tip']} samples)      - Tip left or right bucket")
             print(f"  [2] STEEL KNOCK  (Current: {counts['knock']} samples)    - Tap or knock the steel frame")
             print(f"  [3] BACKGROUND   (Current: {counts['background']} samples)   - Room silence, funnel water drops")
+            print(f"  [u] Undo/Delete last tip sample")
+            print(f"  [c] CLEAR ALL recordings and restart from 0")
             print(f"  [q] Quit")
             print("------------------------------------------------------------------")
 
-            choice = input("Enter choice [1/2/3/q]: ").strip().lower()
+            choice = input("Enter choice [1/2/3/u/c/q]: ").strip().lower()
 
             if choice == "1":
                 record_clip(ser, "tip")
@@ -119,6 +143,12 @@ def main():
                 record_clip(ser, "knock")
             elif choice == "3":
                 record_clip(ser, "background")
+            elif choice == "u":
+                delete_last_sample("tip")
+            elif choice == "c":
+                confirm = input("Are you sure you want to delete ALL samples and restart? (y/n): ").strip().lower()
+                if confirm == "y":
+                    delete_all_dataset()
             elif choice == "q":
                 print("Exiting collector tool. Goodbye!")
                 break
