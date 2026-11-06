@@ -7,14 +7,18 @@
  * Codec / ADC: Onboard ES7210 4-Channel Audio ADC + Dual MEMS Microphones
  * Display: 466x466 Round CO5300 QSPI AMOLED (GFX_Library_for_Arduino)
  *
- * PURPOSE:
- * 1. Accurately profiles the exact physical sound signatures of:
- *    - LEFT BUCKET TIP (Strikes left mechanical stopper)
- *    - RIGHT BUCKET TIP (Strikes right mechanical stopper)
- *    - STEEL FRAME KNOCK (Noise to reject)
- * 2. Captures 50 ms pre/post-trigger raw acoustic impulse.
- * 3. Extracts a 16-point Normalized Energy Envelope & 8-band Frequency Distribution.
- * 4. Outputs averaged C++ reference template arrays ready to paste into matcher firmware!
+ * WORKFLOW:
+ * 1. User starts each sample manually: Send 's' (or spacebar/Enter) in Serial.
+ * 2. 10-Second Countdown Window opens:
+ *    - The AMOLED displays a live 10-second timer and countdown bar.
+ *    - User tips the bucket comfortably at their own pace.
+ *    - The recorder captures the exact 50 ms impulse window.
+ * 3. Review & Accept:
+ *    - Displays exact Peak, Crest, ZCR, and Decay on the AMOLED and Serial Monitor.
+ *    - Press 's' to ACCEPT and move to next sample.
+ *    - Press 'r' to RETRY if there was an accidental noise or mistake.
+ * 4. Export:
+ *    - Automatically generates and prints C++ reference templates!
  * ==============================================================================
  */
 
@@ -49,7 +53,6 @@
 #define PA_EN_PIN   46
 
 #define ES7210_ADDR   0x40
-#define ES8311_ADDR   0x18
 #define TCA9554_ADDR  0x20
 #define AXP2101_ADDR  0x34
 
@@ -68,7 +71,7 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 #define COLOR_CYAN          0x3DFE // Left Tip (Cyan)
 #define COLOR_AMBER         0xFD20 // Right Tip (Amber)
 #define COLOR_CRIMSON       0xF800 // Steel Knock / Noise (Red)
-#define COLOR_EMERALD       0x170A // Success (Green)
+#define COLOR_EMERALD       0x170A // Success / Active (Green)
 #define COLOR_TRACK         0x18E3 // Dark gray track
 #define COLOR_BORDER        0x0459 // Cyan border
 
@@ -84,16 +87,14 @@ Arduino_CO5300 *gfx = new Arduino_CO5300(
 #define ENVELOPE_POINTS     16
 #define SPECTRAL_BANDS      8
 
-// Trigger threshold to start recording an impulse
-int32_t triggerThreshold = 4000;
+// Sensitivity threshold for capturing an impact during the 10s window
+int32_t triggerThreshold = 3500;
 
 static int16_t audioBuffer[SAMPLES_PER_READ * 2]; // 16-bit stereo
-static int16_t ringBuffer[PROFILE_SAMPLES];       // Pre-trigger circular ring
+static int16_t ringBuffer[PROFILE_SAMPLES];       // Pre-trigger ring buffer
 static int ringIndex = 0;
-
 static int16_t capturedWave[PROFILE_SAMPLES];
 
-// Fingerprint Data Structure
 struct SoundProfile {
   int32_t peak;
   float   rms;
@@ -104,34 +105,48 @@ struct SoundProfile {
   float   spectrum[SPECTRAL_BANDS];
 };
 
-#define MAX_SAMPLES_PER_TYPE 5
+#define MAX_SAMPLES_PER_TYPE 3
 SoundProfile leftSamples[MAX_SAMPLES_PER_TYPE];
 SoundProfile rightSamples[MAX_SAMPLES_PER_TYPE];
-SoundProfile steelSamples[MAX_SAMPLES_PER_TYPE];
+SoundProfile steelSamples[2];
 
 int leftCount  = 0;
 int rightCount = 0;
 int steelCount = 0;
 
-// Recording State Machine
-enum RecordMode {
-  MODE_IDLE,
-  MODE_ARM_LEFT,
-  MODE_ARM_RIGHT,
-  MODE_ARM_STEEL
+SoundProfile tempProfile; // Holds the most recently captured profile awaiting confirmation
+
+// Target categories
+enum TargetType {
+  TARGET_LEFT_TIP,
+  TARGET_RIGHT_TIP,
+  TARGET_STEEL_KNOCK,
+  TARGET_ALL_COMPLETE
 };
 
-RecordMode currentMode = MODE_ARM_LEFT;
+TargetType currentTarget = TARGET_LEFT_TIP;
+
+// Interactive 10-Second Window State Machine
+enum SessionState {
+  STATE_WAIT_FOR_START, // Waiting for user to send 's' to start countdown
+  STATE_LISTENING_10S,  // Active 10-second countdown listening for the impact
+  STATE_SAMPLE_REVIEW   // Impact captured! Showing metrics, waiting for 's' (accept) or 'r' (retry)
+};
+
+SessionState sessionState = STATE_WAIT_FOR_START;
+unsigned long windowStartTime = 0;
+const unsigned long WINDOW_MS = 10000; // 10 seconds
+int lastCountdownSec = -1;
 
 bool recordingTriggered = false;
 int  postTriggerSamplesRemaining = 0;
 int  captureWriteIndex = 0;
 
-unsigned long lastTriggerTime = 0;
-const unsigned long DEBOUNCE_MS = 400;
+// UI Dirty flags
+bool needUiFullRedraw = true;
 
 // ==========================================
-// 3. I2C REGISTER HELPERS & HARDWARE INIT
+// 3. I2C & HARDWARE INITIALIZATION
 // ==========================================
 bool writeI2CReg(uint8_t devAddr, uint8_t reg, uint8_t val) {
   Wire.beginTransmission(devAddr);
@@ -144,7 +159,7 @@ void initHardwarePower() {
   Wire.begin(IIC_SDA, IIC_SCL, 400000);
   delay(50);
 
-  // AXP2101: Enable ALDO1-4, BLDO1-2, DLDO1
+  // AXP2101 power rails
   writeI2CReg(AXP2101_ADDR, 0x90, 0xBF);
   writeI2CReg(AXP2101_ADDR, 0x91, 0xFF);
   writeI2CReg(AXP2101_ADDR, 0x92, 0x1F); // ALDO1=3.3V
@@ -152,12 +167,12 @@ void initHardwarePower() {
   writeI2CReg(AXP2101_ADDR, 0x94, 0x1F); // ALDO3=3.3V
   writeI2CReg(AXP2101_ADDR, 0x95, 0x1F); // ALDO4=3.3V
 
-  // TCA9554: Set Pins as Outputs and set HIGH
+  // TCA9554
   writeI2CReg(TCA9554_ADDR, 0x03, 0x00);
   writeI2CReg(TCA9554_ADDR, 0x01, 0xFF);
 
   pinMode(PA_EN_PIN, OUTPUT);
-  digitalWrite(PA_EN_PIN, LOW); // Mute speaker amp
+  digitalWrite(PA_EN_PIN, LOW); // Mute speaker
 }
 
 void initI2S() {
@@ -188,11 +203,11 @@ void initI2S() {
 }
 
 void initES7210() {
-  writeI2CReg(ES7210_ADDR, 0x00, 0xFF); // Reset
+  writeI2CReg(ES7210_ADDR, 0x00, 0xFF);
   delay(20);
   writeI2CReg(ES7210_ADDR, 0x00, 0x41);
-  writeI2CReg(ES7210_ADDR, 0x01, 0x1F); // Clocks
-  writeI2CReg(ES7210_ADDR, 0x06, 0x04); // Power on
+  writeI2CReg(ES7210_ADDR, 0x01, 0x1F);
+  writeI2CReg(ES7210_ADDR, 0x06, 0x04);
   writeI2CReg(ES7210_ADDR, 0x07, 0x00);
   writeI2CReg(ES7210_ADDR, 0x08, 0x10);
 
@@ -205,11 +220,11 @@ void initES7210() {
   writeI2CReg(ES7210_ADDR, 0x41, 0x70);
   writeI2CReg(ES7210_ADDR, 0x42, 0x70);
 
-  // MAX Gain +37.5 dB on front mics (0x1E = +37.5dB)
+  // Maximum gain (+37.5 dB) on both front microphones
   writeI2CReg(ES7210_ADDR, 0x43, 0x1E);
   writeI2CReg(ES7210_ADDR, 0x44, 0x1E);
 
-  writeI2CReg(ES7210_ADDR, 0x4B, 0x00); // Un-mute ADC
+  writeI2CReg(ES7210_ADDR, 0x4B, 0x00);
   writeI2CReg(ES7210_ADDR, 0x4C, 0x00);
   writeI2CReg(ES7210_ADDR, 0x14, 0x03);
   writeI2CReg(ES7210_ADDR, 0x06, 0x00);
@@ -219,7 +234,7 @@ void initES7210() {
   delay(10);
   writeI2CReg(ES7210_ADDR, 0x00, 0x41);
 
-  Serial.println("[ES7210] Onboard Dual Mics Ready for Sampling!");
+  Serial.println("[ES7210] High-Gain Microphones Configured!");
 }
 
 // ==========================================
@@ -242,13 +257,13 @@ void processAndExtractFeatures(const int16_t* wave, SoundProfile* out) {
     }
   }
 
-  out->peak = peakVal;
-  out->rms  = sqrt((float)sumSq / PROFILE_SAMPLES);
+  out->peak  = peakVal;
+  out->rms   = sqrt((float)sumSq / PROFILE_SAMPLES);
   out->crest = (out->rms > 10.0f) ? ((float)out->peak / out->rms) : 0.0f;
-  out->zcr  = zcr;
+  out->zcr   = zcr;
 
-  // 1. Compute 16-point Normalized Energy Envelope (each point = 50 samples)
-  int samplesPerPoint = PROFILE_SAMPLES / ENVELOPE_POINTS; // 50 samples = 3.125 ms
+  // 16-point Normalized Energy Envelope (50 samples per point)
+  int samplesPerPoint = PROFILE_SAMPLES / ENVELOPE_POINTS;
   float maxEnv = 0.0f;
 
   for (int p = 0; p < ENVELOPE_POINTS; p++) {
@@ -262,40 +277,19 @@ void processAndExtractFeatures(const int16_t* wave, SoundProfile* out) {
     if (binRms > maxEnv) maxEnv = binRms;
   }
 
-  // Normalize envelope 0.0 to 1.0
   if (maxEnv > 0.0f) {
     for (int p = 0; p < ENVELOPE_POINTS; p++) {
       out->envelope[p] /= maxEnv;
     }
   }
 
-  // Decay ratio: envelope at ~25ms (point 8) vs peak point
   out->decayRatio = (out->envelope[8] > 0.0f) ? out->envelope[8] : 0.0f;
-
-  // 2. Simplified 8-Band Frequency Energy Distribution (Zero-crossing sub-windows)
-  for (int b = 0; b < SPECTRAL_BANDS; b++) {
-    int bandStart = b * (PROFILE_SAMPLES / SPECTRAL_BANDS);
-    int bandEnd   = bandStart + (PROFILE_SAMPLES / SPECTRAL_BANDS);
-    int bandZcr   = 0;
-    int64_t bSum  = 0;
-
-    for (int i = bandStart; i < bandEnd; i++) {
-      bSum += abs(wave[i]);
-      if (i > bandStart) {
-        if ((wave[i - 1] > 0 && wave[i] < 0) || (wave[i - 1] < 0 && wave[i] > 0)) {
-          bandZcr++;
-        }
-      }
-    }
-    // Estimate energy weighted by zero-crossing band
-    out->spectrum[b] = (float)bSum / (PROFILE_SAMPLES / SPECTRAL_BANDS);
-  }
 }
 
 // ==========================================
 // 5. AMOLED UI RENDERING
 // ==========================================
-void renderUI() {
+void renderBaseUI() {
   gfx->fillScreen(COLOR_BG);
 
   // Outer circles
@@ -305,40 +299,40 @@ void renderUI() {
   // Header Title
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
   gfx->setTextSize(2);
-  gfx->setCursor(75, 40);
+  gfx->setCursor(75, 38);
   gfx->print("TIP SOUND PROFILER");
 
   gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(1);
-  gfx->setCursor(130, 64);
-  gfx->print("ACOUSTIC FINGERPRINT SAMPLER");
+  gfx->setCursor(140, 62);
+  gfx->print("10-SECOND CONTROLLED SAMPLER");
 
-  // Mode Banner Box (Center)
-  gfx->drawRoundRect(35, 90, 396, 90, 16, COLOR_TRACK);
+  // Center Interactive Card Box
+  gfx->drawRoundRect(35, 85, 396, 115, 16, COLOR_TRACK);
 
-  // Status Cards
-  // Left Tip Card
-  gfx->drawRoundRect(35, 195, 125, 95, 12, COLOR_TRACK);
+  // Sample Progress Counters
+  // Left
+  gfx->drawRoundRect(35, 215, 125, 80, 12, COLOR_TRACK);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
   gfx->setTextSize(2);
-  gfx->setCursor(55, 205);
+  gfx->setCursor(55, 225);
   gfx->print("LEFT");
 
-  // Right Tip Card
-  gfx->drawRoundRect(170, 195, 125, 95, 12, COLOR_TRACK);
+  // Right
+  gfx->drawRoundRect(170, 215, 125, 80, 12, COLOR_TRACK);
   gfx->setTextColor(COLOR_AMBER, COLOR_BG);
   gfx->setTextSize(2);
-  gfx->setCursor(185, 205);
+  gfx->setCursor(185, 225);
   gfx->print("RIGHT");
 
-  // Steel Knock Card
-  gfx->drawRoundRect(305, 195, 125, 95, 12, COLOR_TRACK);
+  // Steel
+  gfx->drawRoundRect(305, 215, 125, 80, 12, COLOR_TRACK);
   gfx->setTextColor(COLOR_CRIMSON, COLOR_BG);
   gfx->setTextSize(2);
-  gfx->setCursor(320, 205);
+  gfx->setCursor(320, 225);
   gfx->print("STEEL");
 
-  // Bottom Instructions
+  // Metrics Labels
   gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
   gfx->setTextSize(2);
   gfx->setCursor(45, 310);
@@ -351,77 +345,40 @@ void renderUI() {
   gfx->setCursor(240, 345);
   gfx->print("DECAY:");
 
-  gfx->setCursor(25, 410);
+  // Footer Instructions
+  gfx->setCursor(35, 410);
   gfx->setTextSize(1);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
-  gfx->print("[l: Arm Left | r: Arm Right | k: Arm Steel | p: Export]");
+  gfx->print("[s: START / ACCEPT | r: RETRY | p: EXPORT]");
 }
 
-void updateUIMode() {
-  gfx->fillRect(40, 95, 386, 80, COLOR_BG);
-
-  uint16_t bannerColor = COLOR_CYAN;
-  const char* modeText = "ARMED: LEFT TIP (1/3)";
-  const char* hintText = "-> Tip LEFT bucket with water now!";
-
-  if (currentMode == MODE_ARM_LEFT) {
-    bannerColor = COLOR_CYAN;
-    modeText = "ARMED: LEFT TIP";
-    hintText = "-> Tip LEFT bucket now";
-  } else if (currentMode == MODE_ARM_RIGHT) {
-    bannerColor = COLOR_AMBER;
-    modeText = "ARMED: RIGHT TIP";
-    hintText = "-> Tip RIGHT bucket now";
-  } else if (currentMode == MODE_ARM_STEEL) {
-    bannerColor = COLOR_CRIMSON;
-    modeText = "ARMED: STEEL KNOCK";
-    hintText = "-> Tap steel frame / noise";
-  } else {
-    bannerColor = COLOR_EMERALD;
-    modeText = "SAMPLES READY!";
-    hintText = "-> Press 'p' in Serial to export";
-  }
-
-  gfx->fillRoundRect(50, 105, 366, 36, 8, bannerColor);
-  gfx->setTextColor(COLOR_WHITE, bannerColor);
-  gfx->setTextSize(2);
-  int tLen = strlen(modeText) * 12;
-  gfx->setCursor(50 + (366 - tLen) / 2, 115);
-  gfx->print(modeText);
-
-  gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
-  gfx->setTextSize(1);
-  int hLen = strlen(hintText) * 6;
-  gfx->setCursor(50 + (366 - hLen) / 2, 155);
-  gfx->print(hintText);
-
-  // Update Counters
-  gfx->setTextSize(4);
+void updateStatusCards() {
+  gfx->setTextSize(3);
   char buf[8];
 
-  // Left
-  gfx->fillRect(40, 235, 115, 45, COLOR_BG);
+  // Left (x=55, y=252)
+  gfx->fillRect(40, 250, 115, 36, COLOR_BG);
   gfx->setTextColor(COLOR_CYAN, COLOR_BG);
   snprintf(buf, sizeof(buf), "%d/3", leftCount);
-  gfx->setCursor(55, 238);
+  gfx->setCursor(65, 252);
   gfx->print(buf);
 
-  // Right
-  gfx->fillRect(175, 235, 115, 45, COLOR_BG);
+  // Right (x=190, y=252)
+  gfx->fillRect(175, 250, 115, 36, COLOR_BG);
   gfx->setTextColor(COLOR_AMBER, COLOR_BG);
   snprintf(buf, sizeof(buf), "%d/3", rightCount);
-  gfx->setCursor(190, 238);
+  gfx->setCursor(200, 252);
   gfx->print(buf);
 
-  // Steel
-  gfx->fillRect(310, 235, 115, 45, COLOR_BG);
+  // Steel (x=325, y=252)
+  gfx->fillRect(310, 250, 115, 36, COLOR_BG);
   gfx->setTextColor(COLOR_CRIMSON, COLOR_BG);
   snprintf(buf, sizeof(buf), "%d/2", steelCount);
-  gfx->setCursor(325, 238);
+  gfx->setCursor(335, 252);
   gfx->print(buf);
 }
 
-void updateMetricsUI(const SoundProfile& sp) {
+void updateMetricsDisplay(const SoundProfile& sp) {
   gfx->setTextSize(2);
 
   // PEAK
@@ -450,8 +407,115 @@ void updateMetricsUI(const SoundProfile& sp) {
   gfx->print(dBuf);
 }
 
+// Center Interactive Box Display
+void updateInteractiveBox() {
+  gfx->fillRect(40, 90, 386, 105, COLOR_BG);
+
+  if (sessionState == STATE_WAIT_FOR_START) {
+    uint16_t targetColor = COLOR_CYAN;
+    const char* targetName = "LEFT TIP";
+    int currentSampleNum = leftCount + 1;
+    int totalSampleNum   = 3;
+
+    if (currentTarget == TARGET_LEFT_TIP) {
+      targetColor = COLOR_CYAN;
+      targetName  = "LEFT TIP";
+      currentSampleNum = leftCount + 1;
+      totalSampleNum   = 3;
+    } else if (currentTarget == TARGET_RIGHT_TIP) {
+      targetColor = COLOR_AMBER;
+      targetName  = "RIGHT TIP";
+      currentSampleNum = rightCount + 1;
+      totalSampleNum   = 3;
+    } else if (currentTarget == TARGET_STEEL_KNOCK) {
+      targetColor = COLOR_CRIMSON;
+      targetName  = "STEEL KNOCK";
+      currentSampleNum = steelCount + 1;
+      totalSampleNum   = 2;
+    } else {
+      // All complete
+      gfx->fillRoundRect(48, 96, 370, 40, 8, COLOR_EMERALD);
+      gfx->setTextColor(COLOR_WHITE, COLOR_EMERALD);
+      gfx->setTextSize(2);
+      gfx->setCursor(110, 108);
+      gfx->print("ALL SAMPLES READY!");
+
+      gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+      gfx->setTextSize(2);
+      gfx->setCursor(65, 150);
+      gfx->print("Press 'p' in Serial to export");
+      return;
+    }
+
+    // Top pill: Ready to start
+    gfx->fillRoundRect(48, 96, 370, 38, 8, targetColor);
+    gfx->setTextColor(COLOR_WHITE, targetColor);
+    gfx->setTextSize(2);
+    char titleBuf[32];
+    snprintf(titleBuf, sizeof(titleBuf), "%s (Sample %d/%d)", targetName, currentSampleNum, totalSampleNum);
+    int tLen = strlen(titleBuf) * 12;
+    gfx->setCursor(48 + (370 - tLen) / 2, 106);
+    gfx->print(titleBuf);
+
+    // Call to action
+    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+    gfx->setTextSize(2);
+    gfx->setCursor(80, 145);
+    gfx->print("SEND 's' TO START");
+
+    gfx->setTextColor(COLOR_TEXT_MUTED, COLOR_BG);
+    gfx->setTextSize(1);
+    gfx->setCursor(120, 172);
+    gfx->print("Opens 10-second capture window");
+  }
+  else if (sessionState == STATE_LISTENING_10S) {
+    // 10-Second Listening Active
+    gfx->fillRoundRect(48, 96, 370, 38, 8, COLOR_EMERALD);
+    gfx->setTextColor(COLOR_WHITE, COLOR_EMERALD);
+    gfx->setTextSize(2);
+    gfx->setCursor(75, 106);
+    gfx->print("RECORDING... TIP NOW!");
+
+    // Big digital seconds countdown
+    unsigned long elapsed = millis() - windowStartTime;
+    int secLeft = 10 - (elapsed / 1000);
+    if (secLeft < 0) secLeft = 0;
+
+    gfx->setTextColor(COLOR_WHITE, COLOR_BG);
+    gfx->setTextSize(3);
+    char secBuf[16];
+    snprintf(secBuf, sizeof(secBuf), "%ds REMAINING", secLeft);
+    int sLen = strlen(secBuf) * 18;
+    gfx->setCursor(48 + (370 - sLen) / 2, 145);
+    gfx->print(secBuf);
+
+    // Shrinking Countdown Progress Bar
+    int barW = map(constrain(10000 - elapsed, 0, 10000), 0, 10000, 0, 350);
+    gfx->drawRoundRect(55, 175, 356, 12, 4, COLOR_TRACK);
+    gfx->fillRect(58, 178, barW, 6, COLOR_EMERALD);
+  }
+  else if (sessionState == STATE_SAMPLE_REVIEW) {
+    // Sample Captured! Showing review options
+    gfx->fillRoundRect(48, 96, 370, 38, 8, COLOR_EMERALD);
+    gfx->setTextColor(COLOR_WHITE, COLOR_EMERALD);
+    gfx->setTextSize(2);
+    gfx->setCursor(105, 106);
+    gfx->print("SAMPLE CAPTURED!");
+
+    // Review Actions
+    gfx->setTextColor(COLOR_CYAN, COLOR_BG);
+    gfx->setTextSize(2);
+    gfx->setCursor(65, 142);
+    gfx->print("[s] ACCEPT & NEXT");
+
+    gfx->setTextColor(COLOR_AMBER, COLOR_BG);
+    gfx->setCursor(65, 168);
+    gfx->print("[r] RETRY THIS SAMPLE");
+  }
+}
+
 // ==========================================
-// 6. REFERENCE EXPORT GENERATOR
+// 6. EXPORT C++ REFERENCE CODE
 // ==========================================
 void exportReferenceCode() {
   Serial.println("\n\n/*************************************************************");
@@ -502,9 +566,14 @@ void exportReferenceCode() {
 
   // Steel Knock Average
   int avgSteelZCR = 0;
+  int32_t avgSteelPeak = 0;
   if (steelCount > 0) {
-    for (int i = 0; i < steelCount; i++) avgSteelZCR += steelSamples[i].zcr;
+    for (int i = 0; i < steelCount; i++) {
+      avgSteelZCR += steelSamples[i].zcr;
+      avgSteelPeak += steelSamples[i].peak;
+    }
     avgSteelZCR /= steelCount;
+    avgSteelPeak /= steelCount;
   }
 
   Serial.println("// Reference Profile: LEFT BUCKET TIP");
@@ -527,8 +596,9 @@ void exportReferenceCode() {
   }
   Serial.println("};\n");
 
-  Serial.println("// Reference Noise Reject: STEEL FRAME KNOCK");
-  Serial.printf("const int     REF_STEEL_KNOCK_ZCR = %d;\n", avgSteelZCR);
+  Serial.println("// Reference Noise: STEEL FRAME KNOCK (TO REJECT)");
+  Serial.printf("const int     REF_STEEL_KNOCK_ZCR  = %d;\n", avgSteelZCR);
+  Serial.printf("const int32_t REF_STEEL_KNOCK_PEAK = %ld;\n", avgSteelPeak);
   Serial.println("/*************************************************************/\n");
 }
 
@@ -539,154 +609,226 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=======================================================");
-  Serial.println(" ESP32-S3 AMOLED: Acoustic Tip Fingerprint Recorder");
+  Serial.println(" ESP32-S3 AMOLED: 10-Second Controlled Tip Profiler");
   Serial.println("=======================================================");
 
   gfx->begin();
-  gfx->fillScreen(COLOR_BG);
-  renderUI();
-  updateUIMode();
+  renderBaseUI();
+  updateStatusCards();
+  updateInteractiveBox();
 
   initHardwarePower();
   initI2S();
   initES7210();
 
-  Serial.println("\n[READY] Sampling station online!");
-  Serial.println("-> Default Armed: LEFT BUCKET TIP (Record 3 tips)");
-  Serial.println("-> Controls:");
-  Serial.println("   'l' = Arm for LEFT Tip");
-  Serial.println("   'r' = Arm for RIGHT Tip");
-  Serial.println("   'k' = Arm for STEEL Knock Noise");
-  Serial.println("   'p' = Export & Print C++ Reference Arrays");
-  Serial.println("   'c' = Clear all samples and restart");
+  Serial.println("\n[READY] Interactive Sampling Station Online!");
   Serial.println("-------------------------------------------------------");
+  Serial.println("HOW TO USE:");
+  Serial.println("1. When ready, type 's' and press Enter in Serial.");
+  Serial.println("2. You will have 10 SECONDS to tip the bucket.");
+  Serial.println("3. The system captures the sound and pauses.");
+  Serial.println("4. Type 's' to ACCEPT or 'r' to RETRY that sample.");
+  Serial.println("-------------------------------------------------------");
+  Serial.println("[START] Target 1: LEFT BUCKET TIP (Sample 1 of 3)");
+  Serial.println("-> Type 's' and press Enter whenever you are ready to tip!");
 }
 
 void loop() {
   size_t bytesRead = 0;
   esp_err_t result = i2s_read(I2S_PORT, audioBuffer, sizeof(audioBuffer), &bytesRead, 100 / portTICK_PERIOD_MS);
-
   int samplesRead = bytesRead / sizeof(int16_t);
 
+  unsigned long now = millis();
+
+  // ========================================================
+  // 10-SECOND LISTENING WINDOW HANDLER
+  // ========================================================
+  if (sessionState == STATE_LISTENING_10S) {
+    unsigned long elapsed = now - windowStartTime;
+
+    // Countdown timer display update (every 250ms)
+    static unsigned long lastUiTick = 0;
+    if (now - lastUiTick >= 200) {
+      lastUiTick = now;
+      updateInteractiveBox();
+    }
+
+    // Print countdown second tick in Serial Monitor
+    int secLeft = 10 - (elapsed / 1000);
+    if (secLeft != lastCountdownSec && secLeft >= 0) {
+      lastCountdownSec = secLeft;
+      Serial.printf("[LISTENING] %d seconds remaining... (tip bucket now)\n", secLeft);
+    }
+
+    // Check for Timeout
+    if (elapsed >= WINDOW_MS && !recordingTriggered) {
+      sessionState = STATE_WAIT_FOR_START;
+      lastCountdownSec = -1;
+      updateInteractiveBox();
+      Serial.println("\n[TIMEOUT] 10 seconds expired with no sound detected.");
+      Serial.println("-> Type 's' and press Enter to try this sample again.");
+    }
+  }
+
+  // ========================================================
+  // AUDIO CAPTURE ENGINE
+  // ========================================================
   if (result == ESP_OK && samplesRead > 0) {
-    for (int i = 0; i < samplesRead; i += 2) { // Read Left channel (or interleaved)
+    for (int i = 0; i < samplesRead; i += 2) {
       int16_t sample = audioBuffer[i];
       int32_t absVal = abs(sample);
 
-      // Store in circular pre-trigger buffer
+      // Store in circular ring buffer
       ringBuffer[ringIndex] = sample;
       ringIndex = (ringIndex + 1) % PROFILE_SAMPLES;
 
-      unsigned long now = millis();
+      // Only trigger if we are actively in the 10-second listening window
+      if (sessionState == STATE_LISTENING_10S) {
+        if (!recordingTriggered && (absVal >= triggerThreshold)) {
+          recordingTriggered = true;
 
-      // Trigger condition: sound spike above threshold and not currently recording
-      if (!recordingTriggered && (absVal >= triggerThreshold) && (now - lastTriggerTime > DEBOUNCE_MS)) {
-        recordingTriggered = true;
-        lastTriggerTime = now;
+          // Copy 100 samples before trigger point
+          int startIdx = (ringIndex - PRE_TRIGGER_SAMPLES + PROFILE_SAMPLES) % PROFILE_SAMPLES;
+          for (int p = 0; p < PRE_TRIGGER_SAMPLES; p++) {
+            capturedWave[p] = ringBuffer[(startIdx + p) % PROFILE_SAMPLES];
+          }
 
-        // Copy pre-trigger samples
-        int startIdx = (ringIndex - PRE_TRIGGER_SAMPLES + PROFILE_SAMPLES) % PROFILE_SAMPLES;
-        for (int p = 0; p < PRE_TRIGGER_SAMPLES; p++) {
-          capturedWave[p] = ringBuffer[(startIdx + p) % PROFILE_SAMPLES];
+          captureWriteIndex = PRE_TRIGGER_SAMPLES;
+          postTriggerSamplesRemaining = PROFILE_SAMPLES - PRE_TRIGGER_SAMPLES;
         }
+        else if (recordingTriggered && postTriggerSamplesRemaining > 0) {
+          capturedWave[captureWriteIndex++] = sample;
+          postTriggerSamplesRemaining--;
 
-        captureWriteIndex = PRE_TRIGGER_SAMPLES;
-        postTriggerSamplesRemaining = PROFILE_SAMPLES - PRE_TRIGGER_SAMPLES;
-      }
-      else if (recordingTriggered && postTriggerSamplesRemaining > 0) {
-        capturedWave[captureWriteIndex++] = sample;
-        postTriggerSamplesRemaining--;
+          // Complete 50 ms (800 samples) captured!
+          if (postTriggerSamplesRemaining <= 0) {
+            recordingTriggered = false;
 
-        // Once 800 samples (50 ms) are completely captured:
-        if (postTriggerSamplesRemaining <= 0) {
-          recordingTriggered = false;
+            // Extract features
+            processAndExtractFeatures(capturedWave, &tempProfile);
 
-          SoundProfile sp;
-          processAndExtractFeatures(capturedWave, &sp);
+            sessionState = STATE_SAMPLE_REVIEW;
+            lastCountdownSec = -1;
 
-          updateMetricsUI(sp);
+            updateMetricsDisplay(tempProfile);
+            updateInteractiveBox();
 
-          if (currentMode == MODE_ARM_LEFT) {
-            if (leftCount < MAX_SAMPLES_PER_TYPE) {
-              leftSamples[leftCount++] = sp;
-            }
-            Serial.printf("\n[CAPTURED: LEFT TIP #%d]\n", leftCount);
+            // Print detailed review in Serial Monitor
+            const char* targetName = (currentTarget == TARGET_LEFT_TIP) ? "LEFT TIP" :
+                                     (currentTarget == TARGET_RIGHT_TIP) ? "RIGHT TIP" : "STEEL KNOCK";
+            int currentNum = (currentTarget == TARGET_LEFT_TIP) ? (leftCount + 1) :
+                             (currentTarget == TARGET_RIGHT_TIP) ? (rightCount + 1) : (steelCount + 1);
+
+            Serial.println("\n-------------------------------------------------------");
+            Serial.printf("[CAPTURED: %s (Sample %d)]\n", targetName, currentNum);
             Serial.printf("  Peak: %ld | RMS: %.0f | Crest: %.1fx | ZCR: %d | Decay: %.1f%%\n",
-                          sp.peak, sp.rms, sp.crest, sp.zcr, sp.decayRatio * 100.0f);
+                          tempProfile.peak, tempProfile.rms, tempProfile.crest, tempProfile.zcr, tempProfile.decayRatio * 100.0f);
             Serial.print("  Envelope: { ");
-            for (int p = 0; p < ENVELOPE_POINTS; p++) Serial.printf("%.2f%s", sp.envelope[p], (p < ENVELOPE_POINTS - 1) ? ", " : " ");
+            for (int p = 0; p < ENVELOPE_POINTS; p++) Serial.printf("%.2f%s", tempProfile.envelope[p], (p < ENVELOPE_POINTS - 1) ? ", " : " ");
             Serial.println("}");
-
-            if (leftCount >= 3) {
-              currentMode = MODE_ARM_RIGHT;
-              Serial.println("\n>>> [NEXT STEP] 3 Left Tips Captured! Now armed for RIGHT BUCKET TIP!");
-            }
+            Serial.println("-------------------------------------------------------");
+            Serial.println("OPTIONS:");
+            Serial.println("-> Type 's' to ACCEPT this sample and proceed to next.");
+            Serial.println("-> Type 'r' to RETRY this sample if it was a mistake.");
           }
-          else if (currentMode == MODE_ARM_RIGHT) {
-            if (rightCount < MAX_SAMPLES_PER_TYPE) {
-              rightSamples[rightCount++] = sp;
-            }
-            Serial.printf("\n[CAPTURED: RIGHT TIP #%d]\n", rightCount);
-            Serial.printf("  Peak: %ld | RMS: %.0f | Crest: %.1fx | ZCR: %d | Decay: %.1f%%\n",
-                          sp.peak, sp.rms, sp.crest, sp.zcr, sp.decayRatio * 100.0f);
-            Serial.print("  Envelope: { ");
-            for (int p = 0; p < ENVELOPE_POINTS; p++) Serial.printf("%.2f%s", sp.envelope[p], (p < ENVELOPE_POINTS - 1) ? ", " : " ");
-            Serial.println("}");
-
-            if (rightCount >= 3) {
-              currentMode = MODE_ARM_STEEL;
-              Serial.println("\n>>> [NEXT STEP] 3 Right Tips Captured! Now armed for STEEL KNOCK NOISE!");
-            }
-          }
-          else if (currentMode == MODE_ARM_STEEL) {
-            if (steelCount < MAX_SAMPLES_PER_TYPE) {
-              steelSamples[steelCount++] = sp;
-            }
-            Serial.printf("\n[CAPTURED: STEEL KNOCK #%d]\n", steelCount);
-            Serial.printf("  Peak: %ld | RMS: %.0f | Crest: %.1fx | ZCR: %d | Decay: %.1f%%\n",
-                          sp.peak, sp.rms, sp.crest, sp.zcr, sp.decayRatio * 100.0f);
-
-            if (steelCount >= 2) {
-              currentMode = MODE_IDLE;
-              Serial.println("\n>>> [COMPLETE] All samples captured! Press 'p' to generate reference arrays!");
-            }
-          }
-
-          updateUIMode();
         }
       }
     }
   }
 
-  // Serial Keyboard Commands
+  // ========================================================
+  // SERIAL KEYBOARD COMMANDS
+  // ========================================================
   if (Serial.available()) {
     char c = Serial.read();
-    if (c == 'l' || c == 'L') {
-      currentMode = MODE_ARM_LEFT;
-      updateUIMode();
-      Serial.println("[MODE] Armed for LEFT BUCKET TIP recording.");
+
+    // 's', 'S', spacebar, or Enter to START or ACCEPT
+    if (c == 's' || c == 'S' || c == ' ' || c == '\n' || c == '\r') {
+      if (sessionState == STATE_WAIT_FOR_START) {
+        if (currentTarget != TARGET_ALL_COMPLETE) {
+          sessionState = STATE_LISTENING_10S;
+          windowStartTime = millis();
+          recordingTriggered = false;
+          lastCountdownSec = -1;
+          updateInteractiveBox();
+
+          const char* targetName = (currentTarget == TARGET_LEFT_TIP) ? "LEFT TIP" :
+                                   (currentTarget == TARGET_RIGHT_TIP) ? "RIGHT TIP" : "STEEL KNOCK";
+          int num = (currentTarget == TARGET_LEFT_TIP) ? (leftCount + 1) :
+                    (currentTarget == TARGET_RIGHT_TIP) ? (rightCount + 1) : (steelCount + 1);
+
+          Serial.println("\n>>> [10-SECOND WINDOW STARTED!] <<<");
+          Serial.printf(">>> TIP %s NOW! (Sample %d) <<<\n", targetName, num);
+        }
+      }
+      else if (sessionState == STATE_SAMPLE_REVIEW) {
+        // Accept sample and commit it
+        if (currentTarget == TARGET_LEFT_TIP) {
+          leftSamples[leftCount++] = tempProfile;
+          Serial.printf("[ACCEPTED] Left Tip Sample %d of 3 saved.\n", leftCount);
+          if (leftCount >= 3) {
+            currentTarget = TARGET_RIGHT_TIP;
+            Serial.println("\n=======================================================");
+            Serial.println("[COMPLETE] All 3 Left Tip samples recorded!");
+            Serial.println("Next target: RIGHT BUCKET TIP (Sample 1 of 3)");
+            Serial.println("-> Type 's' when ready to tip the RIGHT bucket.");
+            Serial.println("=======================================================");
+          }
+        }
+        else if (currentTarget == TARGET_RIGHT_TIP) {
+          rightSamples[rightCount++] = tempProfile;
+          Serial.printf("[ACCEPTED] Right Tip Sample %d of 3 saved.\n", rightCount);
+          if (rightCount >= 3) {
+            currentTarget = TARGET_STEEL_KNOCK;
+            Serial.println("\n=======================================================");
+            Serial.println("[COMPLETE] All 3 Right Tip samples recorded!");
+            Serial.println("Next target: STEEL FRAME KNOCK (Sample 1 of 2)");
+            Serial.println("-> Type 's' when ready to tap the steel frame.");
+            Serial.println("=======================================================");
+          }
+        }
+        else if (currentTarget == TARGET_STEEL_KNOCK) {
+          steelSamples[steelCount++] = tempProfile;
+          Serial.printf("[ACCEPTED] Steel Knock Sample %d of 2 saved.\n", steelCount);
+          if (steelCount >= 2) {
+            currentTarget = TARGET_ALL_COMPLETE;
+            Serial.println("\n=======================================================");
+            Serial.println("[ALL RECORDINGS COMPLETE!] Generating Reference Template...");
+            Serial.println("=======================================================");
+            exportReferenceCode();
+          }
+        }
+
+        updateStatusCards();
+        sessionState = STATE_WAIT_FOR_START;
+        updateInteractiveBox();
+      }
     }
+    // 'r' or 'R' to RETRY the current sample
     else if (c == 'r' || c == 'R') {
-      currentMode = MODE_ARM_RIGHT;
-      updateUIMode();
-      Serial.println("[MODE] Armed for RIGHT BUCKET TIP recording.");
+      if (sessionState == STATE_SAMPLE_REVIEW) {
+        sessionState = STATE_WAIT_FOR_START;
+        updateInteractiveBox();
+        Serial.println("[RETRY] Discarded last sample. Ready to re-take.");
+        Serial.println("-> Type 's' whenever you are ready to start 10s window!");
+      }
     }
-    else if (c == 'k' || c == 'K') {
-      currentMode = MODE_ARM_STEEL;
-      updateUIMode();
-      Serial.println("[MODE] Armed for STEEL FRAME KNOCK recording.");
-    }
+    // 'p' or 'P' to EXPORT reference templates at any time
     else if (c == 'p' || c == 'P') {
       exportReferenceCode();
     }
+    // 'c' or 'C' to RESET and start completely over
     else if (c == 'c' || c == 'C') {
       leftCount = 0;
       rightCount = 0;
       steelCount = 0;
-      currentMode = MODE_ARM_LEFT;
-      updateUIMode();
-      Serial.println("[RESET] Cleared all captured samples. Starting over with Left Tip.");
+      currentTarget = TARGET_LEFT_TIP;
+      sessionState = STATE_WAIT_FOR_START;
+      renderBaseUI();
+      updateStatusCards();
+      updateInteractiveBox();
+      Serial.println("\n[RESET] Cleared all samples! Starting over with Left Tip 1/3.");
+      Serial.println("-> Type 's' whenever you are ready!");
     }
   }
 }
-
